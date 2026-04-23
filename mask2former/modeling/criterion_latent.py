@@ -32,7 +32,7 @@ def calculate_entropy_uncertainty(logits):
     return -(probs * log_probs).sum(dim=1, keepdim=True)
 
 
-def soft_dice_loss(inputs, targets, valid_mask, eps=1.0):
+def soft_dice_loss(inputs, targets, valid_mask, num_masks, eps=1.0):
     """
     Softmax DICE loss for mutually-exclusive latent masks.
 
@@ -46,7 +46,7 @@ def soft_dice_loss(inputs, targets, valid_mask, eps=1.0):
     denominator = inputs.sum(dim=-1) + targets.sum(dim=-1)
     loss = 1 - (numerator + eps) / (denominator + eps)
     loss = loss * valid_mask.to(dtype=loss.dtype)
-    return loss.sum() / valid_mask.sum().clamp_min(1).to(dtype=loss.dtype)
+    return loss.sum() / num_masks
 
 
 class LatentCriterion(nn.Module):
@@ -79,12 +79,12 @@ class LatentCriterion(nn.Module):
         self.importance_sample_ratio = importance_sample_ratio
         self.similarity_metric = similarity_metric
 
-    def _get_num_signatures(self, targets):
-        num_signatures = targets["pad_mask"].sum()
-        num_signatures = num_signatures.to(dtype=torch.float)
+    @staticmethod
+    def _get_global_normalizer(counts):
+        counts = counts.to(dtype=torch.float)
         if is_dist_avail_and_initialized():
-            torch.distributed.all_reduce(num_signatures)
-        return torch.clamp(num_signatures / get_world_size(), min=1).item()
+            torch.distributed.all_reduce(counts)
+        return torch.clamp(counts / get_world_size(), min=1).item()
 
     @staticmethod
     def _mask_invalid_slots(logits, pad_mask):
@@ -129,7 +129,6 @@ class LatentCriterion(nn.Module):
         return {"loss_ce": loss_ce}
 
     def loss_masks(self, outputs, targets, num_signatures):
-        del num_signatures
         assert "proto_masks" in outputs
         src_masks = outputs["proto_masks"]
         if not isinstance(src_masks, (list, tuple)):
@@ -149,7 +148,9 @@ class LatentCriterion(nn.Module):
             target_masks_level = self._normalize_target_masks(target_masks_level, pad_mask)
 
             log_probs = F.log_softmax(src_masks_level, dim=1)
-            mask_ce_losses.append(-(target_masks_level * log_probs).sum(dim=1).mean())
+            mask_ce_loss = -(target_masks_level * log_probs).flatten(2).mean(dim=-1)
+            mask_ce_loss = mask_ce_loss * pad_mask.to(dtype=mask_ce_loss.dtype)
+            mask_ce_losses.append(mask_ce_loss.sum() / num_signatures)
 
         losses["loss_mask"] = torch.stack(mask_ce_losses).mean()
 
@@ -178,7 +179,7 @@ class LatentCriterion(nn.Module):
             point_coords,
             align_corners=False,
         )
-        losses["loss_dice"] = soft_dice_loss(point_logits, point_labels, pad_mask)
+        losses["loss_dice"] = soft_dice_loss(point_logits, point_labels, pad_mask, num_signatures)
 
         return losses
 
@@ -203,12 +204,12 @@ class LatentCriterion(nn.Module):
         off_diag_mask = valid_pair_mask & ~eye
 
         if off_diag_mask.any():
-            loss_sep = F.relu(gt_sim[off_diag_mask]).pow(2).mean()
+            valid_pair_count = self._get_global_normalizer(off_diag_mask.sum())
+            loss_sep = F.relu(gt_sim[off_diag_mask]).pow(2).sum() / valid_pair_count
 
         return {"loss_gt_sep": loss_sep}
 
     def loss_seed(self, outputs, targets, num_signatures):
-        del num_signatures
         assert "pred_signatures" in outputs
         assert "pred_seed_logits" in outputs
         assert "gt_signatures" in outputs
@@ -245,7 +246,7 @@ class LatentCriterion(nn.Module):
                 matched_gt_sig.unsqueeze(1),
                 metric=self.similarity_metric,
             ).squeeze(-1).squeeze(-1)
-            loss_seed_sig = (1.0 - matched_similarity).mean()
+            loss_seed_sig = (1.0 - matched_similarity).sum() / num_signatures
 
         return {
             "loss_seed": loss_seed,
@@ -263,7 +264,7 @@ class LatentCriterion(nn.Module):
         return loss_map[loss](outputs, targets, num_signatures)
 
     def forward(self, outputs, targets):
-        num_signatures = self._get_num_signatures(targets)
+        num_signatures = self._get_global_normalizer(targets["pad_mask"].sum())
 
         losses = {}
         for loss in self.losses:
