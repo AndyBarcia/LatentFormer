@@ -13,6 +13,7 @@ from detectron2.projects.point_rend.point_features import (
 )
 from detectron2.utils.comm import get_world_size
 
+from .similarity import pairwise_similarity
 from ..utils.misc import is_dist_avail_and_initialized
 
 
@@ -64,6 +65,7 @@ class LatentCriterion(nn.Module):
         num_points,
         oversample_ratio,
         importance_sample_ratio,
+        identity_similarity_metric,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -73,6 +75,7 @@ class LatentCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+        self.identity_similarity_metric = identity_similarity_metric
 
     def _get_num_signatures(self, targets):
         num_signatures = targets["pad_mask"].sum()
@@ -159,10 +162,36 @@ class LatentCriterion(nn.Module):
 
         return losses
 
+    def loss_gt_sep(self, outputs, targets, num_signatures):
+        del num_signatures
+        assert "gt_signatures" in outputs
+        gt_signatures = outputs["gt_signatures"]
+        pad_mask = targets["pad_mask"].to(device=gt_signatures.device)
+        loss_sep = gt_signatures.sum() * 0.0
+
+        num_gt = pad_mask.shape[1]
+        if num_gt <= 1:
+            return {"loss_gt_sep": loss_sep}
+
+        gt_sim = pairwise_similarity(
+            gt_signatures,
+            gt_signatures,
+            metric=self.identity_similarity_metric,
+        )
+        eye = torch.eye(num_gt, dtype=torch.bool, device=gt_signatures.device).unsqueeze(0)
+        valid_pair_mask = pad_mask.unsqueeze(2) & pad_mask.unsqueeze(1)
+        off_diag_mask = valid_pair_mask & ~eye
+
+        if off_diag_mask.any():
+            loss_sep = F.relu(gt_sim[off_diag_mask]).pow(2).mean()
+
+        return {"loss_gt_sep": loss_sep}
+
     def get_loss(self, loss, outputs, targets, num_signatures):
         loss_map = {
             "labels": self.loss_labels,
             "masks": self.loss_masks,
+            "gt_sep": self.loss_gt_sep,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, num_signatures)
@@ -184,6 +213,7 @@ class LatentCriterion(nn.Module):
             "num_points: {}".format(self.num_points),
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+            "identity_similarity_metric: {}".format(self.identity_similarity_metric),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]

@@ -159,14 +159,21 @@ class LatentFormer(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        gt_sep_weight = cfg.MODEL.LATENT_FORMER.GT_SEP_WEIGHT
+        weight_dict = {
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
+            "loss_dice": dice_weight,
+            "loss_gt_sep": gt_sep_weight,
+        }
         criterion = LatentCriterion(
             sem_seg_head.num_classes,
             weight_dict=weight_dict,
-            losses=["labels", "masks"],
+            losses=["labels", "masks", "gt_sep"],
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            identity_similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
         )
         gt_encoder = GroundTruthEncoder(
             num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
