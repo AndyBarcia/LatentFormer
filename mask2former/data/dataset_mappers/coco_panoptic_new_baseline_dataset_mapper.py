@@ -10,7 +10,7 @@ from detectron2.config import configurable
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
 from detectron2.data.transforms import TransformGen
-from detectron2.structures import BitMasks, Boxes, Instances
+from detectron2.structures import BitMasks, Boxes, BoxMode, Instances
 
 __all__ = ["COCOPanopticNewBaselineDatasetMapper"]
 
@@ -141,11 +141,18 @@ class COCOPanopticNewBaselineDatasetMapper:
             instances = Instances(image_shape)
             classes = []
             masks = []
+            boxes = []
             for segment_info in segments_info:
                 class_id = segment_info["category_id"]
                 if not segment_info["iscrowd"]:
                     classes.append(class_id)
                     masks.append(pan_seg_gt == segment_info["id"])
+                    if "bbox" in segment_info:
+                        boxes.append(
+                            BoxMode.convert(segment_info["bbox"], BoxMode.XYWH_ABS, BoxMode.XYXY_ABS)
+                        )
+                    else:
+                        boxes.append(None)
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)
@@ -158,7 +165,18 @@ class COCOPanopticNewBaselineDatasetMapper:
                     torch.stack([torch.from_numpy(np.ascontiguousarray(x.copy())) for x in masks])
                 )
                 instances.gt_masks = masks.tensor
-                instances.gt_boxes = masks.get_bounding_boxes()
+                mask_boxes = masks.get_bounding_boxes().tensor
+                final_boxes = mask_boxes.clone()
+                annotated_indices = [idx for idx, box in enumerate(boxes) if box is not None]
+                if annotated_indices:
+                    annotated_boxes = transforms.apply_box(
+                        np.asarray([boxes[idx] for idx in annotated_indices], dtype=np.float32)
+                    )
+                    final_boxes[annotated_indices] = torch.as_tensor(
+                        annotated_boxes, dtype=final_boxes.dtype, device=final_boxes.device
+                    )
+                instances.gt_boxes = Boxes(final_boxes)
+                instances.gt_boxes.clip(image_shape)
 
             dataset_dict["instances"] = instances
 

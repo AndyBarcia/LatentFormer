@@ -169,12 +169,6 @@ class COCOInstanceNewBaselineDatasetMapper:
             # NOTE: does not support BitMask due to augmentation
             # Current BitMask cannot handle empty objects
             instances = utils.annotations_to_instances(annos, image_shape)
-            # After transforms such as cropping are applied, the bounding box may no longer
-            # tightly bound the object. As an example, imagine a triangle object
-            # [(0,0), (2,0), (0,2)] cropped by a box [(1,0),(2,2)] (XYXY format). The tight
-            # bounding box of the cropped triangle should be [(1,0),(2,1)], which is not equal to
-            # the intersection of original bounding box and the cropping box.
-            instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
             # Need to filter empty instances first (due to augmentation)
             instances = utils.filter_empty_instances(instances)
             # Generate masks from polygon

@@ -31,6 +31,10 @@ MODEL:
     PRE_NORM: False
     ENFORCE_INPUT_PROJ: False
     SIZE_DIVISIBILITY: 32
+    GT_ENCODER:
+      HIDDEN_DIM: 256
+      SIG_DIM: 256
+      FEATURE_LEVELS: ["res2", "res3", "res4", "res5"]
     TEST:
       SEMANTIC_ON: True
       INSTANCE_ON: True

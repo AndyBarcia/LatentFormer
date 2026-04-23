@@ -11,7 +11,7 @@ from detectron2.config import configurable
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
 from detectron2.projects.point_rend import ColorAugSSDTransform
-from detectron2.structures import BitMasks, Instances, polygons_to_bitmask
+from detectron2.structures import BitMasks, Boxes, Instances, polygons_to_bitmask
 
 __all__ = ["MaskFormerInstanceDatasetMapper"]
 
@@ -144,6 +144,7 @@ class MaskFormerInstanceDatasetMapper:
 
         classes = [int(obj["category_id"]) for obj in annos]
         classes = torch.tensor(classes, dtype=torch.int64)
+        boxes = torch.tensor([obj["bbox"] for obj in annos], dtype=torch.float32).reshape(-1, 4)
 
         if self.size_divisibility > 0:
             image_size = (image.shape[-2], image.shape[-1])
@@ -168,6 +169,7 @@ class MaskFormerInstanceDatasetMapper:
         # Prepare per-category binary masks
         instances = Instances(image_shape)
         instances.gt_classes = classes
+        instances.gt_boxes = Boxes(boxes)
         if len(masks) == 0:
             # Some image does not have annotation (all ignored)
             instances.gt_masks = torch.zeros((0, image.shape[-2], image.shape[-1]))
