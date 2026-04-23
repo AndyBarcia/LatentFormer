@@ -248,16 +248,10 @@ class LatentTransformerDecoder(nn.Module):
             predictions_seed.append(outputs_seed)
 
         out = {
-            "pred_logits": predictions_class[-1],
-            "pred_masks": predictions_mask[-1],
-            "pred_signatures": predictions_sig[-1],
-            "pred_seed_logits": predictions_seed[-1],
-            "aux_outputs": self._set_aux_loss(
-                predictions_class,
-                predictions_mask,
-                predictions_sig,
-                predictions_seed,
-            ),
+            "pred_logits": torch.stack(predictions_class),
+            "pred_masks": torch.stack(predictions_mask),
+            "pred_signatures": torch.stack(predictions_sig),
+            "pred_seed_logits": torch.stack(predictions_seed),
         }
         return out
 
@@ -283,26 +277,3 @@ class LatentTransformerDecoder(nn.Module):
             attn_biases.append(attn_bias)
 
         return outputs_class, mask_embed, outputs_sig, outputs_seed, attn_biases
-
-    @torch.jit.unused
-    def _set_aux_loss(
-        self,
-        outputs_class,
-        outputs_seg_masks,
-        outputs_sig,
-        outputs_seed,
-    ):
-        return [
-            {
-                "pred_logits": a,
-                "pred_masks": b,
-                "pred_signatures": c,
-                "pred_seed_logits": d,
-            }
-            for a, b, c, d in zip(
-                outputs_class[:-1],
-                outputs_seg_masks[:-1],
-                outputs_sig[:-1],
-                outputs_seed[:-1],
-            )
-        ]
