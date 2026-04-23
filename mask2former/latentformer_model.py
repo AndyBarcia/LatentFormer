@@ -2,17 +2,21 @@
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
 from detectron2.modeling.backbone import Backbone
-from detectron2.structures import ImageList
+from detectron2.modeling.postprocessing import sem_seg_postprocess
+from detectron2.structures import Boxes, ImageList, Instances
+from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion_latent import LatentCriterion
 from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
+from .modeling.seed_selection import SeedSelection
 from .modeling.similarity import pairwise_similarity
 
 
@@ -113,6 +117,7 @@ class LatentFormer(nn.Module):
         criterion: nn.Module,
         gt_encoder: nn.Module,
         aggregator: nn.Module,
+        seed_selection: nn.Module,
         num_queries: int,
         metadata,
         size_divisibility: int,
@@ -124,6 +129,7 @@ class LatentFormer(nn.Module):
         instance_on: bool,
         test_topk_per_image: int,
         score_threshold: float,
+        overlap_threshold: float,
     ):
         super().__init__()
         self.backbone = backbone
@@ -132,6 +138,7 @@ class LatentFormer(nn.Module):
         self.criterion = criterion
         self.gt_encoder = gt_encoder
         self.aggregator = aggregator
+        self.seed_selection = seed_selection
         self.num_queries = num_queries
         self.metadata = metadata
         if size_divisibility < 0:
@@ -146,6 +153,7 @@ class LatentFormer(nn.Module):
         self.panoptic_on = panoptic_on
         self.test_topk_per_image = test_topk_per_image
         self.score_threshold = score_threshold
+        self.overlap_threshold = overlap_threshold
 
     @classmethod
     def from_config(cls, cfg):
@@ -189,6 +197,11 @@ class LatentFormer(nn.Module):
         aggregator = LatentAggregator(
             aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
         )
+        seed_selection = SeedSelection(
+            seed_threshold=cfg.MODEL.LATENT_FORMER.TEST.SEED_THRESHOLD,
+            duplicate_threshold=cfg.MODEL.LATENT_FORMER.TEST.DUPLICATE_THRESHOLD,
+            similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
+        )
 
         return {
             "backbone": backbone,
@@ -197,6 +210,7 @@ class LatentFormer(nn.Module):
             "criterion": criterion,
             "gt_encoder": gt_encoder,
             "aggregator": aggregator,
+            "seed_selection": seed_selection,
             "num_queries": cfg.MODEL.LATENT_FORMER.NUM_OBJECT_QUERIES,
             "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
             "size_divisibility": cfg.MODEL.LATENT_FORMER.SIZE_DIVISIBILITY,
@@ -212,6 +226,7 @@ class LatentFormer(nn.Module):
             "panoptic_on": cfg.MODEL.LATENT_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "score_threshold": cfg.MODEL.LATENT_FORMER.TEST.SCORE_THRESHOLD,
+            "overlap_threshold": cfg.MODEL.LATENT_FORMER.TEST.OVERLAP_THRESHOLD,
         }
 
     @property
@@ -256,13 +271,183 @@ class LatentFormer(nn.Module):
                 else:
                     losses.pop(k)
             return losses
-        else:
-            raise NotImplementedError("LatentFormer inference aggregation is not implemented yet.")
 
-        return self.inference(outputs, batched_inputs, images.image_sizes)
+        return self.inference(
+            outputs,
+            batched_inputs,
+            images.image_sizes,
+            padded_image_size=images.tensor.shape[-2:],
+        )
 
-    def inference(self, outputs, batched_inputs, image_sizes):
-        raise NotImplementedError("LatentFormer inference path is not implemented yet.")
+    def inference(self, outputs, batched_inputs, image_sizes, padded_image_size):
+        seed_signatures, seed_pad_mask, _ = self.seed_selection(
+            outputs["pred_signatures"],
+            outputs["pred_seed_logits"],
+        )
+        proto_cls, proto_masks, _ = self.aggregator(
+            outputs["pred_logits"],
+            outputs["pred_masks"],
+            outputs["pred_signatures"],
+            seed_signatures,
+            mask_features=outputs["mask_features"],
+            target_pad_mask=seed_pad_mask,
+        )
+
+        mask_pred_results = max(proto_masks, key=lambda masks: masks.shape[-2] * masks.shape[-1])
+        mask_pred_results = F.interpolate(
+            mask_pred_results,
+            size=padded_image_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        processed_results = []
+        for mask_cls_result, mask_pred_result, pad_mask_per_image, input_per_image, image_size in zip(
+            proto_cls,
+            mask_pred_results,
+            seed_pad_mask,
+            batched_inputs,
+            image_sizes,
+        ):
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+            processed_results.append({})
+
+            valid_mask_cls = mask_cls_result[pad_mask_per_image]
+            valid_mask_pred = mask_pred_result[pad_mask_per_image]
+
+            if self.sem_seg_postprocess_before_inference:
+                valid_mask_pred = retry_if_cuda_oom(sem_seg_postprocess)(
+                    valid_mask_pred,
+                    image_size,
+                    height,
+                    width,
+                )
+                valid_mask_cls = valid_mask_cls.to(valid_mask_pred)
+
+            if self.semantic_on:
+                sem_seg = retry_if_cuda_oom(self.semantic_inference)(valid_mask_cls, valid_mask_pred)
+                if not self.sem_seg_postprocess_before_inference:
+                    sem_seg = retry_if_cuda_oom(sem_seg_postprocess)(sem_seg, image_size, height, width)
+                processed_results[-1]["sem_seg"] = sem_seg
+
+            if self.panoptic_on:
+                processed_results[-1]["panoptic_seg"] = retry_if_cuda_oom(self.panoptic_inference)(
+                    valid_mask_cls,
+                    valid_mask_pred,
+                )
+
+            if self.instance_on:
+                processed_results[-1]["instances"] = retry_if_cuda_oom(self.instance_inference)(
+                    valid_mask_cls,
+                    valid_mask_pred,
+                )
+
+        return processed_results
+
+    def semantic_inference(self, mask_cls, mask_pred):
+        if mask_cls.shape[0] == 0:
+            return mask_pred.new_zeros((self.sem_seg_head.num_classes, *mask_pred.shape[-2:]))
+        class_probs = F.softmax(mask_cls, dim=-1)[..., :-1]
+        mask_probs = F.softmax(mask_pred, dim=0)
+        return torch.einsum("qc,qhw->chw", class_probs, mask_probs)
+
+    def panoptic_inference(self, mask_cls, mask_pred):
+        if mask_cls.shape[0] == 0:
+            h, w = mask_pred.shape[-2:]
+            return torch.zeros((h, w), dtype=torch.int32, device=mask_pred.device), []
+
+        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        mask_probs = F.softmax(mask_pred, dim=0)
+
+        keep = labels.ne(self.sem_seg_head.num_classes) & (scores > self.score_threshold)
+        cur_scores = scores[keep]
+        cur_classes = labels[keep]
+        cur_masks = mask_probs[keep]
+
+        h, w = cur_masks.shape[-2:]
+        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
+        segments_info = []
+        current_segment_id = 0
+
+        if cur_masks.shape[0] == 0:
+            return panoptic_seg, segments_info
+
+        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
+        cur_mask_ids = cur_prob_masks.argmax(0)
+        stuff_memory_list = {}
+        for k in range(cur_classes.shape[0]):
+            pred_class = cur_classes[k].item()
+            isthing = pred_class in self.metadata.thing_dataset_id_to_contiguous_id.values()
+            mask_area = (cur_mask_ids == k).sum().item()
+            original_area = (cur_masks[k] >= 0.5).sum().item()
+            mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
+
+            if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                if mask_area / original_area < self.overlap_threshold:
+                    continue
+
+                if not isthing:
+                    if int(pred_class) in stuff_memory_list:
+                        panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                        continue
+                    stuff_memory_list[int(pred_class)] = current_segment_id + 1
+
+                current_segment_id += 1
+                panoptic_seg[mask] = current_segment_id
+                segments_info.append(
+                    {
+                        "id": current_segment_id,
+                        "isthing": bool(isthing),
+                        "category_id": int(pred_class),
+                    }
+                )
+
+        return panoptic_seg, segments_info
+
+    def instance_inference(self, mask_cls, mask_pred):
+        image_size = mask_pred.shape[-2:]
+        if mask_cls.shape[0] == 0:
+            result = Instances(image_size)
+            result.pred_masks = torch.zeros((0, *image_size), dtype=mask_pred.dtype, device=mask_pred.device)
+            result.pred_boxes = Boxes(torch.zeros((0, 4), dtype=mask_pred.dtype, device=mask_pred.device))
+            result.scores = torch.zeros((0,), dtype=mask_pred.dtype, device=mask_pred.device)
+            result.pred_classes = torch.zeros((0,), dtype=torch.long, device=mask_pred.device)
+            return result
+
+        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
+        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(
+            mask_cls.shape[0], 1
+        ).flatten(0, 1)
+        scores_per_image, topk_indices = scores.flatten(0, 1).topk(
+            min(self.test_topk_per_image, scores.numel()),
+            sorted=False,
+        )
+        labels_per_image = labels[topk_indices]
+        topk_indices = topk_indices // self.sem_seg_head.num_classes
+        mask_probs = F.softmax(mask_pred, dim=0)[topk_indices]
+
+        keep = scores_per_image > self.score_threshold
+        if self.panoptic_on:
+            for idx, label in enumerate(labels_per_image):
+                keep[idx] = keep[idx] & (
+                    label in self.metadata.thing_dataset_id_to_contiguous_id.values()
+                )
+
+        scores_per_image = scores_per_image[keep]
+        labels_per_image = labels_per_image[keep]
+        mask_probs = mask_probs[keep]
+
+        result = Instances(image_size)
+        result.pred_masks = (mask_probs >= 0.5).float()
+        result.pred_boxes = Boxes(torch.zeros((mask_probs.size(0), 4), dtype=mask_probs.dtype, device=mask_probs.device))
+        mask_scores_per_image = (
+            (mask_probs * result.pred_masks).flatten(1).sum(1)
+            / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        )
+        result.scores = scores_per_image * mask_scores_per_image
+        result.pred_classes = labels_per_image
+        return result
 
     def prepare_gt_encoder_inputs(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
