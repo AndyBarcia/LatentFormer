@@ -12,6 +12,90 @@ from detectron2.structures import ImageList
 
 from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
+from .modeling.similarity import pairwise_similarity
+
+
+def assignment_weights_from_similarity(
+    *,
+    similarity: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    weights = similarity.clamp_min(0.0)
+    if valid_mask is not None:
+        weights = weights * valid_mask.unsqueeze(-2).to(dtype=weights.dtype)
+    return weights
+
+
+def normalize_assignment_weights(
+    weights: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    denom = weights.sum(dim=-2, keepdim=True).clamp_min(eps)
+    return weights / denom
+
+
+def aggregate_with_weights(weights: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("bqs,bqc->bsc", weights, values)
+
+
+class LatentAggregator(nn.Module):
+    """Aggregate per-layer query predictions into seed-conditioned prototypes."""
+
+    def __init__(self, aggregation_similarity_metric: str = "dot"):
+        super().__init__()
+        self.aggregation_similarity_metric = aggregation_similarity_metric
+
+    @staticmethod
+    def _flatten_layer_queries(values: torch.Tensor, name: str) -> torch.Tensor:
+        if values.dim() < 3:
+            raise ValueError(f"{name} must have at least 3 dimensions, got {values.shape}.")
+        if values.dim() == 3:
+            return values
+        if values.dim() == 4:
+            layers, batch, queries = values.shape[:3]
+            return values.permute(1, 0, 2, 3).reshape(batch, layers * queries, values.shape[-1])
+        raise ValueError(f"{name} must be shaped [B,Q,C] or [L,B,Q,C], got {values.shape}.")
+
+    def forward(
+        self,
+        query_class_logits: torch.Tensor,
+        query_mask_embeddings: torch.Tensor,
+        query_signatures: torch.Tensor,
+        seed_signatures: torch.Tensor,
+        *,
+        mask_features,
+        target_pad_mask: torch.Tensor = None,
+    ):
+        q_cls_flat = self._flatten_layer_queries(query_class_logits, "query_class_logits")
+        q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
+        q_sig_flat = self._flatten_layer_queries(query_signatures, "query_signatures")
+
+        sim = pairwise_similarity(
+            q_sig_flat,
+            seed_signatures,
+            metric=self.aggregation_similarity_metric,
+        )
+        weights_flat = assignment_weights_from_similarity(
+            similarity=sim,
+            valid_mask=target_pad_mask,
+        )
+        norm_w = normalize_assignment_weights(weights_flat)
+
+        proto_mask_emb = aggregate_with_weights(norm_w, q_mask_emb_flat)
+        proto_cls = aggregate_with_weights(norm_w, q_cls_flat)
+        proto_masks = [torch.einsum("bsc,bchw->bshw", proto_mask_emb, feature) for feature in mask_features]
+
+        if target_pad_mask is not None:
+            valid = target_pad_mask.unsqueeze(-1).to(dtype=proto_cls.dtype)
+            proto_cls = proto_cls * valid
+            proto_mask_emb = proto_mask_emb * valid
+            proto_masks = [
+                masks * target_pad_mask[:, :, None, None].to(dtype=masks.dtype)
+                for masks in proto_masks
+            ]
+
+        return proto_cls, proto_masks, proto_mask_emb
 
 
 @META_ARCH_REGISTRY.register()
@@ -26,6 +110,7 @@ class LatentFormer(nn.Module):
         sem_seg_head: nn.Module,
         matcher: nn.Module,
         gt_encoder: nn.Module,
+        aggregator: nn.Module,
         num_queries: int,
         metadata,
         size_divisibility: int,
@@ -43,6 +128,7 @@ class LatentFormer(nn.Module):
         self.sem_seg_head = sem_seg_head
         self.matcher = matcher
         self.gt_encoder = gt_encoder
+        self.aggregator = aggregator
         self.num_queries = num_queries
         self.metadata = metadata
         if size_divisibility < 0:
@@ -63,7 +149,7 @@ class LatentFormer(nn.Module):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         matcher = LatentMatcher(
-            similarity_metric=cfg.MODEL.LATENT_FORMER.SIMILARITY_METRIC,
+            similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
             seed_cost_weight=cfg.MODEL.LATENT_FORMER.SEED_COST_WEIGHT,
         )
         gt_encoder = GroundTruthEncoder(
@@ -72,12 +158,16 @@ class LatentFormer(nn.Module):
             sig_dim=cfg.MODEL.LATENT_FORMER.GT_ENCODER.SIG_DIM,
             feature_levels=cfg.MODEL.LATENT_FORMER.GT_ENCODER.FEATURE_LEVELS,
         )
+        aggregator = LatentAggregator(
+            aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
+        )
 
         return {
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "matcher": matcher,
             "gt_encoder": gt_encoder,
+            "aggregator": aggregator,
             "num_queries": cfg.MODEL.LATENT_FORMER.NUM_OBJECT_QUERIES,
             "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
             "size_divisibility": cfg.MODEL.LATENT_FORMER.SIZE_DIVISIBILITY,
@@ -108,18 +198,29 @@ class LatentFormer(nn.Module):
         outputs = self.sem_seg_head(features)
 
         if self.training:
-            if "instances" in batched_inputs[0]:
-                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-                targets = self.prepare_gt_encoder_inputs(gt_instances, images)
-                outputs["gt_signature"] = self.gt_encoder(
-                    features,
-                    targets["masks"],
-                    targets["labels"],
-                    targets["boxes"],
-                    targets["pad_mask"],
-                )
-                outputs["gt_pad_mask"] = targets["pad_mask"]
-            raise NotImplementedError("LatentFormer training losses are not implemented yet.")
+            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            targets = self.prepare_gt_encoder_inputs(gt_instances, images)
+            outputs["gt_signatures"] = self.gt_encoder(
+                features,
+                targets["masks"],
+                targets["labels"],
+                targets["boxes"],
+                targets["pad_mask"],
+            )
+            proto_cls, proto_masks, proto_mask_emb = self.aggregator(
+                outputs["pred_logits"],
+                outputs["pred_masks"],
+                outputs["pred_signatures"],
+                outputs["gt_signatures"],
+                mask_features=outputs["mask_features"],
+                target_pad_mask=targets["pad_mask"],
+            )
+
+            outputs["proto_cls"] = proto_cls
+            outputs["proto_masks"] = proto_masks
+            outputs["proto_mask_emb"] = proto_mask_emb
+        else:
+            raise NotImplementedError("LatentFormer inference aggregation is not implemented yet.")
 
         return self.inference(outputs, batched_inputs, images.image_sizes)
 

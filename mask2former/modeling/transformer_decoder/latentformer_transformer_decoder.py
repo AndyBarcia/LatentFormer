@@ -224,6 +224,7 @@ class LatentTransformerDecoder(nn.Module):
         predictions_mask = []
         predictions_sig = []
         predictions_seed = []
+        _, _, _, _, attn_biases = self.forward_prediction_heads(output, multi_scale_features)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
