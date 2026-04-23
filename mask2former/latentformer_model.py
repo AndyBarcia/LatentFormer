@@ -229,9 +229,10 @@ class LatentFormer(nn.Module):
 
     def prepare_gt_encoder_inputs(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
+        background_label = self.gt_encoder.background_label
         max_instances = max(
             (len(targets_per_image.gt_classes) for targets_per_image in targets), default=0
-        )
+        ) + 1
         batch_size = len(targets)
 
         masks = torch.zeros(
@@ -239,7 +240,12 @@ class LatentFormer(nn.Module):
             dtype=images.tensor.dtype,
             device=self.device,
         )
-        labels = torch.zeros((batch_size, max_instances), dtype=torch.long, device=self.device)
+        labels = torch.full(
+            (batch_size, max_instances),
+            background_label,
+            dtype=torch.long,
+            device=self.device,
+        )
         boxes = torch.zeros(
             (batch_size, max_instances, 4),
             dtype=images.tensor.dtype,
@@ -248,11 +254,24 @@ class LatentFormer(nn.Module):
         pad_mask = torch.zeros((batch_size, max_instances), dtype=torch.bool, device=self.device)
 
         for idx, targets_per_image in enumerate(targets):
+            image_height, image_width = images.image_sizes[idx]
             num_instances = len(targets_per_image.gt_classes)
+            background_idx = num_instances
+            masks[idx, background_idx, :image_height, :image_width] = 1.0
+            boxes[idx, background_idx] = boxes.new_tensor(
+                [
+                    image_width * 0.5 / float(w_pad),
+                    image_height * 0.5 / float(h_pad),
+                    image_width / float(w_pad),
+                    image_height / float(h_pad),
+                ]
+            )
+            pad_mask[idx, background_idx] = True
+
+            if num_instances > 0 and not hasattr(targets_per_image, "gt_boxes"):
+                raise ValueError("LatentFormer GroundTruthEncoder requires annotation gt_boxes.")
             if num_instances == 0:
                 continue
-            if not hasattr(targets_per_image, "gt_boxes"):
-                raise ValueError("LatentFormer GroundTruthEncoder requires annotation gt_boxes.")
 
             gt_masks = targets_per_image.gt_masks
             if hasattr(gt_masks, "tensor"):
@@ -262,6 +281,11 @@ class LatentFormer(nn.Module):
                 dtype=masks.dtype
             )
             labels[idx, :num_instances] = targets_per_image.gt_classes
+            bg_height = min(gt_masks.shape[-2], image_height)
+            bg_width = min(gt_masks.shape[-1], image_width)
+            masks[idx, background_idx, :bg_height, :bg_width] = 1.0 - gt_masks[
+                :, :bg_height, :bg_width
+            ].to(dtype=masks.dtype).clamp(0, 1).amax(dim=0)
             gt_boxes = targets_per_image.gt_boxes.tensor.to(device=self.device, dtype=boxes.dtype)
             x0, y0, x1, y1 = gt_boxes.unbind(dim=-1)
             boxes[idx, :num_instances] = torch.stack(

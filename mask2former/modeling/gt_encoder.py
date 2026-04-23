@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 
 class GroundTruthEncoder(nn.Module):
-    """Encode class, box, and mask-context cues for LatentFormer ground-truth objects."""
+    """Encode class, box, and mask-context cues for LatentFormer ground-truth regions."""
 
     def __init__(
         self,
@@ -19,7 +19,9 @@ class GroundTruthEncoder(nn.Module):
     ):
         super().__init__()
         self.feature_levels = tuple(feature_levels or ())
-        self.gt_cls_proj = nn.Embedding(num_classes, sig_dim)
+        self.num_classes = num_classes
+        self.background_label = num_classes
+        self.gt_cls_proj = nn.Embedding(num_classes + 1, sig_dim)
         self.gt_bbox_proj = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.ReLU(inplace=True),
