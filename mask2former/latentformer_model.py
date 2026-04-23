@@ -160,20 +160,25 @@ class LatentFormer(nn.Module):
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         gt_sep_weight = cfg.MODEL.LATENT_FORMER.GT_SEP_WEIGHT
+        seed_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT
+        seed_sig_weight = cfg.MODEL.LATENT_FORMER.SEED_SIG_WEIGHT
         weight_dict = {
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_gt_sep": gt_sep_weight,
+            "loss_seed": seed_weight,
+            "loss_seed_sig": seed_sig_weight,
         }
         criterion = LatentCriterion(
             sem_seg_head.num_classes,
+            matcher=matcher,
             weight_dict=weight_dict,
-            losses=["labels", "masks", "gt_sep"],
+            losses=["labels", "masks", "gt_sep", "seed"],
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            identity_similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
+            similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
         )
         gt_encoder = GroundTruthEncoder(
             num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
