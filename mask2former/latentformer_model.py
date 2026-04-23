@@ -10,6 +10,7 @@ from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_se
 from detectron2.modeling.backbone import Backbone
 from detectron2.structures import ImageList
 
+from .modeling.criterion_latent import LatentCriterion
 from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
 from .modeling.similarity import pairwise_similarity
@@ -109,6 +110,7 @@ class LatentFormer(nn.Module):
         backbone: Backbone,
         sem_seg_head: nn.Module,
         matcher: nn.Module,
+        criterion: nn.Module,
         gt_encoder: nn.Module,
         aggregator: nn.Module,
         num_queries: int,
@@ -127,6 +129,7 @@ class LatentFormer(nn.Module):
         self.backbone = backbone
         self.sem_seg_head = sem_seg_head
         self.matcher = matcher
+        self.criterion = criterion
         self.gt_encoder = gt_encoder
         self.aggregator = aggregator
         self.num_queries = num_queries
@@ -152,6 +155,19 @@ class LatentFormer(nn.Module):
             similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
             seed_cost_weight=cfg.MODEL.LATENT_FORMER.SEED_COST_WEIGHT,
         )
+
+        class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
+        dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
+        mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        criterion = LatentCriterion(
+            sem_seg_head.num_classes,
+            weight_dict=weight_dict,
+            losses=["labels", "masks"],
+            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
+            importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+        )
         gt_encoder = GroundTruthEncoder(
             num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             hidden_dim=cfg.MODEL.LATENT_FORMER.GT_ENCODER.HIDDEN_DIM,
@@ -166,6 +182,7 @@ class LatentFormer(nn.Module):
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "matcher": matcher,
+            "criterion": criterion,
             "gt_encoder": gt_encoder,
             "aggregator": aggregator,
             "num_queries": cfg.MODEL.LATENT_FORMER.NUM_OBJECT_QUERIES,
@@ -219,6 +236,14 @@ class LatentFormer(nn.Module):
             outputs["proto_cls"] = proto_cls
             outputs["proto_masks"] = proto_masks
             outputs["proto_mask_emb"] = proto_mask_emb
+
+            losses = self.criterion(outputs, targets)
+            for k in list(losses.keys()):
+                if k in self.criterion.weight_dict:
+                    losses[k] *= self.criterion.weight_dict[k]
+                else:
+                    losses.pop(k)
+            return losses
         else:
             raise NotImplementedError("LatentFormer inference aggregation is not implemented yet.")
 

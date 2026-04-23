@@ -20,10 +20,12 @@ class LatentFormerHead(nn.Module):
         self,
         input_shape: Dict[str, ShapeSpec],
         *,
+        num_classes: int,
         latent_fpn: nn.Module,
         transformer_predictor: nn.Module,
     ):
         super().__init__()
+        self.num_classes = num_classes
         self.in_features = [k for k, _ in sorted(input_shape.items(), key=lambda x: x[1].stride)]
         self.latent_fpn = latent_fpn
         self.predictor = transformer_predictor
@@ -34,6 +36,7 @@ class LatentFormerHead(nn.Module):
             "input_shape": {
                 k: v for k, v in input_shape.items() if k in cfg.MODEL.SEM_SEG_HEAD.IN_FEATURES
             },
+            "num_classes": cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             "latent_fpn": build_pixel_decoder(cfg, input_shape),
             "transformer_predictor": build_latentformer_transformer_decoder(
                 cfg,
