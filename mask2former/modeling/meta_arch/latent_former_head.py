@@ -8,6 +8,7 @@ from detectron2.layers import ShapeSpec
 from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 
 from ..pixel_decoder.fpn import build_pixel_decoder
+from ..transformer_decoder.latentformer_transformer_decoder import build_latentformer_transformer_decoder
 
 
 @SEM_SEG_HEADS_REGISTRY.register()
@@ -19,20 +20,13 @@ class LatentFormerHead(nn.Module):
         self,
         input_shape: Dict[str, ShapeSpec],
         *,
-        num_classes: int,
         latent_fpn: nn.Module,
-        ignore_value: int = -1,
-        loss_weight: float = 1.0,
+        transformer_predictor: nn.Module,
     ):
         super().__init__()
         self.in_features = [k for k, _ in sorted(input_shape.items(), key=lambda x: x[1].stride)]
-        self.ignore_value = ignore_value
-        self.loss_weight = loss_weight
         self.latent_fpn = latent_fpn
-        self.num_classes = num_classes
-
-        # TODO: replace these placeholders with LatentFormer prediction heads.
-        self.predictor = nn.Identity()
+        self.predictor = transformer_predictor
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -40,10 +34,12 @@ class LatentFormerHead(nn.Module):
             "input_shape": {
                 k: v for k, v in input_shape.items() if k in cfg.MODEL.SEM_SEG_HEAD.IN_FEATURES
             },
-            "ignore_value": cfg.MODEL.SEM_SEG_HEAD.IGNORE_VALUE,
-            "num_classes": cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             "latent_fpn": build_pixel_decoder(cfg, input_shape),
-            "loss_weight": cfg.MODEL.SEM_SEG_HEAD.LOSS_WEIGHT,
+            "transformer_predictor": build_latentformer_transformer_decoder(
+                cfg,
+                cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM,
+                mask_classification=True,
+            ),
         }
 
     def forward(self, features, mask=None):
@@ -51,7 +47,4 @@ class LatentFormerHead(nn.Module):
 
     def layers(self, features, mask=None):
         multi_scale_features = self.latent_fpn.forward_features(features)
-        raise NotImplementedError(
-            "LatentFormerHead prediction layers are not implemented yet. "
-            "Use multi_scale_features as the FPN inputs."
-        )
+        return self.predictor(multi_scale_features)
