@@ -16,7 +16,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from .modeling.criterion_latent import LatentCriterion
 from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
-from .modeling.seed_selection import SeedSelection
+from .modeling.seed_selection import build_seed_selection_modules
 from .modeling.similarity import pairwise_similarity
 
 
@@ -117,7 +117,7 @@ class LatentFormer(nn.Module):
         criterion: nn.Module,
         gt_encoder: nn.Module,
         aggregator: nn.Module,
-        seed_selection: nn.Module,
+        seed_selection_modules: nn.Module,
         num_queries: int,
         metadata,
         size_divisibility: int,
@@ -138,7 +138,7 @@ class LatentFormer(nn.Module):
         self.criterion = criterion
         self.gt_encoder = gt_encoder
         self.aggregator = aggregator
-        self.seed_selection = seed_selection
+        self.seed_selection_modules = seed_selection_modules
         self.num_queries = num_queries
         self.metadata = metadata
         if size_divisibility < 0:
@@ -196,7 +196,9 @@ class LatentFormer(nn.Module):
         aggregator = LatentAggregator(
             aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
         )
-        seed_selection = SeedSelection(
+        eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
+        seed_selection_modules = build_seed_selection_modules(
+            eval_modes=eval_modes,
             seed_threshold=cfg.MODEL.LATENT_FORMER.TEST.SEED_THRESHOLD,
             duplicate_threshold=cfg.MODEL.LATENT_FORMER.TEST.DUPLICATE_THRESHOLD,
             similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
@@ -209,7 +211,7 @@ class LatentFormer(nn.Module):
             "criterion": criterion,
             "gt_encoder": gt_encoder,
             "aggregator": aggregator,
-            "seed_selection": seed_selection,
+            "seed_selection_modules": seed_selection_modules,
             "num_queries": cfg.MODEL.LATENT_FORMER.NUM_OBJECT_QUERIES,
             "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
             "size_divisibility": cfg.MODEL.LATENT_FORMER.SIZE_DIVISIBILITY,
@@ -240,16 +242,12 @@ class LatentFormer(nn.Module):
         features = self.backbone(images.tensor)
         outputs = self.sem_seg_head(features)
 
+        if self._needs_gt_signatures():
+            targets = self._prepare_gt_signatures(batched_inputs, images, outputs)
+        else:
+            targets = None
+
         if self.training:
-            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets = self.prepare_gt_encoder_inputs(gt_instances, images)
-            outputs["gt_signatures"] = self.gt_encoder(
-                outputs["mask_features"],
-                targets["masks"],
-                targets["labels"],
-                targets["boxes"],
-                targets["pad_mask"],
-            )
             proto_cls, proto_masks, proto_mask_emb = self.aggregator(
                 outputs["pred_logits"],
                 outputs["pred_masks"],
@@ -270,19 +268,73 @@ class LatentFormer(nn.Module):
                 else:
                     losses.pop(k)
             return losses
+        else:
+            return self.inference(
+                outputs,
+                batched_inputs,
+                images.image_sizes,
+                padded_image_size=images.tensor.shape[-2:],
+                targets=targets,
+            )
 
-        return self.inference(
-            outputs,
-            batched_inputs,
-            images.image_sizes,
-            padded_image_size=images.tensor.shape[-2:],
+    def _needs_gt_signatures(self):
+        return self.training or any(
+            seed_selection.requires_gt_signatures
+            for seed_selection in self.seed_selection_modules.values()
         )
 
-    def inference(self, outputs, batched_inputs, image_sizes, padded_image_size):
-        seed_signatures, seed_pad_mask, _ = self.seed_selection(
-            outputs["pred_signatures"],
-            outputs["pred_seed_logits"],
+    def _prepare_gt_signatures(self, batched_inputs, images, outputs):
+        if any("instances" not in x for x in batched_inputs):
+            raise ValueError(
+                "LatentFormer needs GT instances to encode GT signatures, but the current batch "
+                "does not include them. For GT-backed eval modes, enable "
+                "MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL."
+            )
+
+        gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+        targets = self.prepare_gt_encoder_inputs(gt_instances, images)
+        outputs["gt_signatures"] = self.gt_encoder(
+            outputs["mask_features"],
+            targets["masks"],
+            targets["labels"],
+            targets["boxes"],
+            targets["pad_mask"],
         )
+        return targets
+
+    def inference(self, outputs, batched_inputs, image_sizes, padded_image_size, targets=None):
+        mode_results = {}
+        for mode, seed_selection in self.seed_selection_modules.items():
+            gt_signatures = outputs.get("gt_signatures")
+            gt_pad_mask = targets["pad_mask"] if targets is not None else None
+            seed_signatures, seed_pad_mask, _ = seed_selection(
+                outputs["pred_signatures"],
+                outputs["pred_seed_logits"],
+                gt_signatures=gt_signatures,
+                gt_pad_mask=gt_pad_mask,
+            )
+            mode_results[mode] = self._inference_with_seeds(
+                outputs,
+                batched_inputs,
+                image_sizes,
+                padded_image_size,
+                seed_signatures,
+                seed_pad_mask,
+            )
+
+        if len(mode_results) == 1:
+            return next(iter(mode_results.values()))
+        return mode_results
+
+    def _inference_with_seeds(
+        self,
+        outputs,
+        batched_inputs,
+        image_sizes,
+        padded_image_size,
+        seed_signatures,
+        seed_pad_mask,
+    ):
         proto_cls, proto_masks, _ = self.aggregator(
             outputs["pred_logits"],
             outputs["pred_masks"],

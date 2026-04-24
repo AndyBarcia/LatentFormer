@@ -22,7 +22,13 @@ def build_transform_gen(cfg, is_train):
     Returns:
         list[Augmentation]
     """
-    assert is_train, "Only support training augmentation"
+    if not is_train:
+        return [
+            T.ResizeShortestEdge(
+                cfg.INPUT.MIN_SIZE_TEST,
+                cfg.INPUT.MAX_SIZE_TEST,
+            )
+        ]
     image_size = cfg.INPUT.IMAGE_SIZE
     min_scale = cfg.INPUT.MIN_SCALE
     max_scale = cfg.INPUT.MAX_SCALE
@@ -70,6 +76,7 @@ class COCOPanopticNewBaselineDatasetMapper:
         *,
         tfm_gens,
         image_format,
+        load_eval_gt=False,
     ):
         """
         NOTE: this interface is experimental.
@@ -89,6 +96,7 @@ class COCOPanopticNewBaselineDatasetMapper:
 
         self.img_format = image_format
         self.is_train = is_train
+        self.load_eval_gt = load_eval_gt
 
     @classmethod
     def from_config(cls, cfg, is_train=True):
@@ -99,6 +107,10 @@ class COCOPanopticNewBaselineDatasetMapper:
             "is_train": is_train,
             "tfm_gens": tfm_gens,
             "image_format": cfg.INPUT.FORMAT,
+            "load_eval_gt": (
+                cfg.MODEL.META_ARCHITECTURE == "LatentFormer"
+                and cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL
+            ),
         }
         return ret
 
@@ -122,7 +134,7 @@ class COCOPanopticNewBaselineDatasetMapper:
         # Therefore it's important to use torch.Tensor.
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
-        if not self.is_train:
+        if not self.is_train and not self.load_eval_gt:
             # USER: Modify this if you want to keep them for some reason.
             dataset_dict.pop("annotations", None)
             return dataset_dict

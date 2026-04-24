@@ -27,6 +27,7 @@ import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog, build_detection_train_loader
+from detectron2.data import build_detection_test_loader
 from detectron2.engine import (
     DefaultTrainer,
     default_argument_parser,
@@ -43,6 +44,7 @@ from detectron2.evaluation import (
     SemSegEvaluator,
     verify_results,
 )
+from detectron2.evaluation.evaluator import DatasetEvaluator, inference_on_dataset
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
@@ -59,6 +61,30 @@ from mask2former import (
     add_latentformer_config,
     add_maskformer2_config,
 )
+
+
+class LatentFormerMultiModeEvaluator(DatasetEvaluator):
+    def __init__(self, evaluators_by_mode):
+        self.evaluators_by_mode = evaluators_by_mode
+
+    def reset(self):
+        for evaluator in self.evaluators_by_mode.values():
+            evaluator.reset()
+
+    def process(self, inputs, outputs):
+        for mode, evaluator in self.evaluators_by_mode.items():
+            mode_outputs = outputs[mode] if isinstance(outputs, dict) else outputs
+            evaluator.process(inputs, mode_outputs)
+
+    def evaluate(self):
+        results = OrderedDict()
+        for mode, evaluator in self.evaluators_by_mode.items():
+            mode_results = evaluator.evaluate()
+            if mode_results is None:
+                continue
+            for key, value in mode_results.items():
+                results[f"{mode}/{key}"] = value
+        return results
 
 
 def _limited_eval_image_ids(dataset_dicts):
@@ -223,6 +249,48 @@ class Trainer(DefaultTrainer):
         return DatasetEvaluators(evaluator_list)
 
     @classmethod
+    def build_test_loader(cls, cfg, dataset_name):
+        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
+            mapper = COCOPanopticNewBaselineDatasetMapper(cfg, False)
+            return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+        return super().build_test_loader(cfg, dataset_name)
+
+    @classmethod
+    def test(cls, cfg, model, evaluators=None):
+        eval_modes = ()
+        if cfg.MODEL.META_ARCHITECTURE == "LatentFormer":
+            eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
+        if len(eval_modes) <= 1:
+            return super().test(cfg, model, evaluators)
+
+        logger = logging.getLogger(__name__)
+        results = OrderedDict()
+        for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
+            data_loader = cls.build_test_loader(cfg, dataset_name)
+            if evaluators is not None:
+                evaluator = evaluators[idx]
+            else:
+                evaluators_by_mode = OrderedDict()
+                for mode in eval_modes:
+                    evaluators_by_mode[mode] = cls.build_evaluator(
+                        cfg,
+                        dataset_name,
+                        output_folder=os.path.join(cfg.OUTPUT_DIR, "inference", mode),
+                    )
+                evaluator = LatentFormerMultiModeEvaluator(evaluators_by_mode)
+            results_i = inference_on_dataset(model, data_loader, evaluator)
+            results[dataset_name] = results_i
+            if comm.is_main_process():
+                logger.info("Evaluation results for %s in csv format:", dataset_name)
+                from detectron2.evaluation.testing import print_csv_format
+
+                print_csv_format(results_i)
+
+        if len(results) == 1:
+            results = list(results.values())[0]
+        return results
+
+    @classmethod
     def build_train_loader(cls, cfg):
         # Semantic segmentation dataset mapper
         if cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
@@ -365,6 +433,14 @@ def setup(args):
     add_latentformer_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    if (
+        cfg.MODEL.META_ARCHITECTURE == "LatentFormer"
+        and any(
+            mode in {"GoldenSeedSelection", "GTOracleSeedSelection"}
+            for mode in cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES
+        )
+    ):
+        cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL = True
     _register_limited_test_datasets(cfg, cfg.TEST.EVAL_MAX_IMAGES)
     cfg.freeze()
     default_setup(cfg, args)

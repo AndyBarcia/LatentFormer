@@ -157,5 +157,13 @@ def add_latentformer_config(cfg):
     cfg.MODEL.LATENT_FORMER.TEST.SEED_THRESHOLD = 0.5
     cfg.MODEL.LATENT_FORMER.TEST.DUPLICATE_THRESHOLD = 0.8
     cfg.MODEL.LATENT_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
+    # Available LatentFormer seed evaluation modes are seed-selection module names:
+    # ClusteringSeedSelection, GoldenSeedSelection, GTOracleSeedSelection.
+    cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES = (
+        "ClusteringSeedSelection",
+        "GoldenSeedSelection",
+        "GTOracleSeedSelection",
+    )
+    cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL = False
 
     cfg.TEST.EVAL_MAX_IMAGES = 0
