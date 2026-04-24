@@ -1,7 +1,7 @@
 This is a fork of the Mask2Former repo that is trying to implement a novel architecture called LatentFormer. It's design an principles can be read in `LATENT_ARCH.md`.
 
 This is a shared work environment, so be careful.
-- We have assigned an H200 node that we can use with `tsp gpu exec command`. We can only use an H200 at a time.
+- We have assigned an H200 node that we can use with `tsp gpu exec command`. We can only use an H200 at a time. We must always use `tsp`; direct GPU usage without it is forbidden. Any GPU processes that do not use `tsp` will be monitoried and terminated.
 - Datasets are in `/data/datasets/`. Don't write or break anything there.
 - In this environment we need to use `apptainer`. The SIF file `/data/andy.barcia/fcclip-torch27-cu126.sif` should have everything we need to execute this model.
 

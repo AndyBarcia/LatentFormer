@@ -14,6 +14,7 @@ except:
 
 import copy
 import itertools
+import json
 import logging
 import os
 
@@ -25,7 +26,7 @@ import torch
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog, build_detection_train_loader
+from detectron2.data import DatasetCatalog, MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
     DefaultTrainer,
     default_argument_parser,
@@ -58,6 +59,73 @@ from mask2former import (
     add_latentformer_config,
     add_maskformer2_config,
 )
+
+
+def _limited_eval_image_ids(dataset_dicts):
+    image_ids = {record["image_id"] for record in dataset_dicts if "image_id" in record}
+    if not image_ids:
+        return None
+    return image_ids
+
+
+def _write_limited_coco_json(json_file, limited_name, image_ids, output_dir, suffix):
+    with open(json_file) as handle:
+        annotations = json.load(handle)
+
+    annotations["images"] = [
+        image for image in annotations.get("images", []) if image.get("id") in image_ids
+    ]
+    annotations["annotations"] = [
+        annotation
+        for annotation in annotations.get("annotations", [])
+        if annotation.get("image_id") in image_ids
+    ]
+
+    annotation_dir = os.path.join(output_dir, "dev_eval_annotations")
+    os.makedirs(annotation_dir, exist_ok=True)
+    limited_json = os.path.join(annotation_dir, f"{limited_name}_{suffix}.json")
+    with open(limited_json, "w") as handle:
+        json.dump(annotations, handle)
+    return limited_json
+
+
+def _update_limited_eval_metadata(metadata, limited_name, dataset_dicts, output_dir):
+    image_ids = _limited_eval_image_ids(dataset_dicts)
+    if image_ids is None:
+        return
+
+    if metadata.get("panoptic_json"):
+        metadata["panoptic_json"] = _write_limited_coco_json(
+            metadata["panoptic_json"], limited_name, image_ids, output_dir, "panoptic"
+        )
+    if metadata.get("json_file"):
+        metadata["json_file"] = _write_limited_coco_json(
+            metadata["json_file"], limited_name, image_ids, output_dir, "instances"
+        )
+
+
+def _register_limited_test_datasets(cfg, limit):
+    if limit <= 0 or len(cfg.DATASETS.TEST) == 0:
+        return
+
+    logger = logging.getLogger(__name__)
+    limited_names = []
+    for dataset_name in cfg.DATASETS.TEST:
+        limited_name = f"{dataset_name}_dev_subset_{limit}"
+        if limited_name not in DatasetCatalog.list():
+            dataset_dicts = DatasetCatalog.get(dataset_name)[:limit]
+            DatasetCatalog.register(
+                limited_name,
+                lambda dataset_dicts=dataset_dicts: dataset_dicts,
+            )
+            metadata = MetadataCatalog.get(dataset_name).as_dict()
+            metadata.pop("name", None)
+            _update_limited_eval_metadata(metadata, limited_name, dataset_dicts, cfg.OUTPUT_DIR)
+            MetadataCatalog.get(limited_name).set(**metadata)
+        limited_names.append(limited_name)
+
+    cfg.DATASETS.TEST = tuple(limited_names)
+    logger.info("Using limited evaluation datasets: %s", ", ".join(limited_names))
 
 
 class Trainer(DefaultTrainer):
@@ -297,6 +365,7 @@ def setup(args):
     add_latentformer_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    _register_limited_test_datasets(cfg, cfg.TEST.EVAL_MAX_IMAGES)
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "mask_former" module

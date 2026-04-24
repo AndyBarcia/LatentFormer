@@ -113,6 +113,9 @@ def add_maskformer2_config(cfg):
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
 
+    # Optionally limit number of images for evaluation.
+    cfg.TEST.EVAL_MAX_IMAGES = 0
+
 
 def add_latentformer_config(cfg):
     """
@@ -159,3 +162,5 @@ def add_latentformer_config(cfg):
     cfg.MODEL.LATENT_FORMER.TEST.SEED_THRESHOLD = 0.5
     cfg.MODEL.LATENT_FORMER.TEST.DUPLICATE_THRESHOLD = 0.8
     cfg.MODEL.LATENT_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
+
+    cfg.TEST.EVAL_MAX_IMAGES = 0

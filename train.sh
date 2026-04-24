@@ -14,12 +14,13 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/latentformer_R50_smoke}"
 RUN_MODE="${RUN_MODE:-smoke}"  # smoke, train, or eval
 
 NUM_GPUS="${NUM_GPUS:-1}"
-IMS_PER_BATCH="${IMS_PER_BATCH:-1}"
-MAX_ITER="${MAX_ITER:-20}"
+IMS_PER_BATCH="${IMS_PER_BATCH:-8}"
+MAX_ITER="${MAX_ITER:-100}"
 EVAL_PERIOD="${EVAL_PERIOD:-0}"
-CHECKPOINT_PERIOD="${CHECKPOINT_PERIOD:-20}"
+CHECKPOINT_PERIOD="${CHECKPOINT_PERIOD:-50}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 USE_TSP="${USE_TSP:-1}"
+SMOKE_EVAL_MAX_IMAGES="${SMOKE_EVAL_MAX_IMAGES:-8}"
 
 LOGDIR="${LOGDIR:-${PROJ_ROOT}/${OUTPUT_DIR}/logs}"
 mkdir -p "${LOGDIR}"
@@ -31,6 +32,55 @@ echo "Project root: ${PROJ_ROOT}"
 echo "Config: ${CONFIG_FILE}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Run mode: ${RUN_MODE}"
+
+log_git_info() {
+  if ! command -v git >/dev/null 2>&1 || ! git -C "${PROJ_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Git info: unavailable"
+    return
+  fi
+
+  log_untracked_patches() {
+    local path
+    local printed=0
+
+    while IFS= read -r path; do
+      if [[ "${printed}" == "0" ]]; then
+        printed=1
+      fi
+
+      echo "----- Untracked file: ${path} -----"
+      git -C "${PROJ_ROOT}" diff --no-index --no-ext-diff --binary -- /dev/null "${path}" || true
+    done < <(git -C "${PROJ_ROOT}" ls-files --others --exclude-standard)
+
+    if [[ "${printed}" == "0" ]]; then
+      echo "<none>"
+    fi
+  }
+
+  echo "===== Git info ====="
+  echo "Branch: $(git -C "${PROJ_ROOT}" branch --show-current || true)"
+  echo "Commit: $(git -C "${PROJ_ROOT}" rev-parse HEAD || true)"
+  echo "Commit date: $(git -C "${PROJ_ROOT}" log -1 --format=%cI || true)"
+  echo "Commit subject: $(git -C "${PROJ_ROOT}" log -1 --format=%s || true)"
+  echo "Upstream: $(git -C "${PROJ_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo '<none>')"
+  echo "Status:"
+  git -C "${PROJ_ROOT}" status --short --branch || true
+  echo "Modified/staged/untracked files:"
+  git -C "${PROJ_ROOT}" status --porcelain=v1 | sed 's/^/  /' || true
+  echo "Diff summary:"
+  git -C "${PROJ_ROOT}" diff --stat || true
+  echo "Staged diff summary:"
+  git -C "${PROJ_ROOT}" diff --cached --stat || true
+  echo "===== Git staged patch ====="
+  git -C "${PROJ_ROOT}" diff --cached --no-ext-diff --binary || true
+  echo "===== Git unstaged patch ====="
+  git -C "${PROJ_ROOT}" diff --no-ext-diff --binary || true
+  echo "===== Git untracked patches ====="
+  log_untracked_patches
+  echo "===================="
+}
+
+log_git_info
 
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -66,6 +116,7 @@ case "${RUN_MODE}" in
       SOLVER.MAX_ITER "${MAX_ITER}"
       SOLVER.CHECKPOINT_PERIOD "${CHECKPOINT_PERIOD}"
       TEST.EVAL_PERIOD "${EVAL_PERIOD}"
+      TEST.EVAL_MAX_IMAGES "${SMOKE_EVAL_MAX_IMAGES}"
     )
     ;;
   train)
