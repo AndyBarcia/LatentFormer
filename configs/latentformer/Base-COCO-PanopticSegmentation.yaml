@@ -16,9 +16,6 @@ MODEL:
     LATENT_FPN_NUM_LEVELS: 3
   LATENT_FORMER:
     TRANSFORMER_DECODER_NAME: "LatentTransformerDecoder"
-    TRANSFORMER_IN_FEATURE: "multi_scale_fpn"
-    DEEP_SUPERVISION: True
-    NO_OBJECT_WEIGHT: 0.1
     MATCHING_SIMILARITY_METRIC: "cosine"
     AGGREGATION_SIMILARITY_METRIC: "cosine"
     SEED_COST_WEIGHT: 1.0
@@ -30,7 +27,6 @@ MODEL:
     NHEADS: 8
     DROPOUT: 0.0
     DIM_FEEDFORWARD: 2048
-    ENC_LAYERS: 0
     DEC_LAYERS: 10
     PRE_NORM: False
     ENFORCE_INPUT_PROJ: False
@@ -38,7 +34,6 @@ MODEL:
     GT_ENCODER:
       HIDDEN_DIM: 256
       SIG_DIM: 256
-      FEATURE_LEVELS: ["res2", "res3", "res4", "res5"]
     TEST:
       SEMANTIC_ON: True
       INSTANCE_ON: True
