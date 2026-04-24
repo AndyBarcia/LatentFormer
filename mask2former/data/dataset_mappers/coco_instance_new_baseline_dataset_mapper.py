@@ -178,6 +178,7 @@ class COCOInstanceNewBaselineDatasetMapper:
                 gt_masks = instances.gt_masks
                 gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                 instances.gt_masks = gt_masks
+                instances.gt_boxes = BitMasks(gt_masks).get_bounding_boxes()
             dataset_dict["instances"] = instances
 
         return dataset_dict
