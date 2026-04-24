@@ -1,8 +1,9 @@
 # output dir
-output
+outputs
 instant_test_output
 inference_test_output
 
+.codex
 
 *.png
 *.json
