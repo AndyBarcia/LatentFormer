@@ -192,7 +192,6 @@ class LatentFormer(nn.Module):
             num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,
             hidden_dim=cfg.MODEL.LATENT_FORMER.GT_ENCODER.HIDDEN_DIM,
             sig_dim=cfg.MODEL.LATENT_FORMER.GT_ENCODER.SIG_DIM,
-            feature_levels=cfg.MODEL.LATENT_FORMER.GT_ENCODER.FEATURE_LEVELS,
         )
         aggregator = LatentAggregator(
             aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
@@ -245,7 +244,7 @@ class LatentFormer(nn.Module):
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             targets = self.prepare_gt_encoder_inputs(gt_instances, images)
             outputs["gt_signatures"] = self.gt_encoder(
-                features,
+                outputs["mask_features"],
                 targets["masks"],
                 targets["labels"],
                 targets["boxes"],

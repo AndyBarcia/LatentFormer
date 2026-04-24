@@ -34,7 +34,7 @@ class GroundTruthEncoder(nn.Module):
         )
 
     def _select_feature_maps(
-        self, features: Union[Dict[str, torch.Tensor], torch.Tensor]
+        self, features: Union[Dict[str, torch.Tensor], Sequence[torch.Tensor], torch.Tensor]
     ) -> Iterable[torch.Tensor]:
         if isinstance(features, dict):
             if self.feature_levels:
@@ -44,6 +44,10 @@ class GroundTruthEncoder(nn.Module):
             if len(feature_maps) == 0:
                 raise ValueError("GroundTruthEncoder received no matching feature maps.")
             return feature_maps
+        if isinstance(features, (list, tuple)):
+            if len(features) == 0:
+                raise ValueError("GroundTruthEncoder received an empty feature list.")
+            return features
         return (features,)
 
     def _encode_gt_mask_context(
@@ -71,7 +75,7 @@ class GroundTruthEncoder(nn.Module):
 
     def forward(
         self,
-        features: Union[Dict[str, torch.Tensor], torch.Tensor],
+        features: Union[Dict[str, torch.Tensor], Sequence[torch.Tensor], torch.Tensor],
         masks: torch.Tensor,
         labels: torch.Tensor,
         boxes: torch.Tensor,
