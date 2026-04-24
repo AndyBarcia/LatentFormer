@@ -65,6 +65,12 @@ class Trainer(DefaultTrainer):
     Extension of the Trainer class adapted to MaskFormer.
     """
 
+    @staticmethod
+    def _model_test_cfg(cfg):
+        if cfg.MODEL.META_ARCHITECTURE == "LatentFormer":
+            return cfg.MODEL.LATENT_FORMER.TEST
+        return cfg.MODEL.MASK_FORMER.TEST
+
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
         """
@@ -76,6 +82,7 @@ class Trainer(DefaultTrainer):
         """
         if output_folder is None:
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
+        model_test_cfg = cls._model_test_cfg(cfg)
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         # semantic segmentation
@@ -97,17 +104,17 @@ class Trainer(DefaultTrainer):
             "cityscapes_panoptic_seg",
             "mapillary_vistas_panoptic_seg",
         ]:
-            if cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
+            if model_test_cfg.PANOPTIC_ON:
                 evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
         # COCO
-        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        if evaluator_type == "coco_panoptic_seg" and model_test_cfg.INSTANCE_ON:
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+        if evaluator_type == "coco_panoptic_seg" and model_test_cfg.SEMANTIC_ON:
             evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
         # Mapillary Vistas
-        if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        if evaluator_type == "mapillary_vistas_panoptic_seg" and model_test_cfg.INSTANCE_ON:
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+        if evaluator_type == "mapillary_vistas_panoptic_seg" and model_test_cfg.SEMANTIC_ON:
             evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
         # Cityscapes
         if evaluator_type == "cityscapes_instance":
@@ -121,18 +128,18 @@ class Trainer(DefaultTrainer):
             ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesSemSegEvaluator(dataset_name)
         if evaluator_type == "cityscapes_panoptic_seg":
-            if cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+            if model_test_cfg.SEMANTIC_ON:
                 assert (
                     torch.cuda.device_count() > comm.get_rank()
                 ), "CityscapesEvaluator currently do not work with multiple machines."
                 evaluator_list.append(CityscapesSemSegEvaluator(dataset_name))
-            if cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+            if model_test_cfg.INSTANCE_ON:
                 assert (
                     torch.cuda.device_count() > comm.get_rank()
                 ), "CityscapesEvaluator currently do not work with multiple machines."
                 evaluator_list.append(CityscapesInstanceEvaluator(dataset_name))
         # ADE20K
-        if evaluator_type == "ade20k_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        if evaluator_type == "ade20k_panoptic_seg" and model_test_cfg.INSTANCE_ON:
             evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
         # LVIS
         if evaluator_type == "lvis":
