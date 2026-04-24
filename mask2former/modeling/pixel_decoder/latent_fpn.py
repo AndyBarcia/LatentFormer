@@ -71,7 +71,7 @@ class LatentFPN(nn.Module):
             "num_feature_levels": cfg.MODEL.SEM_SEG_HEAD.get("LATENT_FPN_NUM_LEVELS", 3),
         }
 
-    def forward_features(self, features):
+    def forward_features(self, features, mask=None):
         multi_scale_features = []
         y = None
         for idx, feature_name in enumerate(self.in_features[::-1]):

@@ -49,7 +49,7 @@ class LatentFormerHead(nn.Module):
         return self.layers(features, mask)
 
     def layers(self, features, mask=None):
-        multi_scale_features = self.latent_fpn.forward_features(features)
-        predictions = self.predictor(multi_scale_features)
+        multi_scale_features = self.latent_fpn.forward_features(features, mask=mask)
+        predictions = self.predictor(multi_scale_features, mask=mask)
         predictions["mask_features"] = multi_scale_features
         return predictions

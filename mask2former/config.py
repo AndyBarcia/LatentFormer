@@ -115,6 +115,9 @@ def add_maskformer2_config(cfg):
 
     # Optionally limit number of images for evaluation.
     cfg.TEST.EVAL_MAX_IMAGES = 0
+    # Per-process image batch size for evaluation. Keep the Detectron2 default
+    # behavior unless explicitly overridden.
+    cfg.TEST.IMS_PER_BATCH = 1
 
 
 def add_latentformer_config(cfg):
@@ -167,3 +170,4 @@ def add_latentformer_config(cfg):
     cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL = False
 
     cfg.TEST.EVAL_MAX_IMAGES = 0
+    cfg.TEST.IMS_PER_BATCH = 1

@@ -18,6 +18,7 @@ from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
 from .modeling.seed_selection import build_seed_selection_modules
 from .modeling.similarity import pairwise_similarity
+from .utils.padding import image_padding_mask
 
 
 def assignment_weights_from_similarity(
@@ -240,7 +241,10 @@ class LatentFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        outputs = self.sem_seg_head(
+            features,
+            mask=image_padding_mask(images),
+        )
 
         if self._needs_gt_signatures():
             targets = self._prepare_gt_signatures(batched_inputs, images, outputs)

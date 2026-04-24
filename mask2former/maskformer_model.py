@@ -15,6 +15,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from .utils.padding import image_padding_mask
 
 
 @META_ARCH_REGISTRY.register()
@@ -195,7 +196,10 @@ class MaskFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        outputs = self.sem_seg_head(
+            features,
+            mask=image_padding_mask(images),
+        )
 
         if self.training:
             # mask classification target

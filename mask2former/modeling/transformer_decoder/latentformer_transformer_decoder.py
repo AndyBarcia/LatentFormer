@@ -16,6 +16,7 @@ from .mask2former_transformer_decoder import (
 )
 from .maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from .position_encoding import PositionEmbeddingSine
+from ...utils.padding import nonempty_padding_mask, resize_padding_mask
 
 
 def build_latentformer_transformer_decoder(cfg, in_channels, mask_classification=True):
@@ -63,6 +64,7 @@ class AttnResidualDecoder(nn.Module):
         layer_idx: int,
         memory: Tensor,
         memory_mask: Optional[Tensor],
+        memory_key_padding_mask: Optional[Tensor],
         pos: Tensor,
         query_pos: Tensor,
     ) -> Tensor:
@@ -73,7 +75,7 @@ class AttnResidualDecoder(nn.Module):
             output,
             memory,
             memory_mask=memory_mask,
-            memory_key_padding_mask=None,
+            memory_key_padding_mask=memory_key_padding_mask,
             pos=pos,
             query_pos=query_pos,
         )
@@ -202,18 +204,20 @@ class LatentTransformerDecoder(nn.Module):
 
     def forward(self, multi_scale_features, mask=None):
         assert len(multi_scale_features) == self.num_feature_levels
-        del mask
 
         src = []
         pos = []
+        padding_masks = []
         for i, feature in enumerate(multi_scale_features):
-            pos_i = self.pe_layer(feature, None).flatten(2).permute(2, 0, 1)
+            padding_mask = resize_padding_mask(mask, feature.shape[-2:])
+            pos_i = self.pe_layer(feature, padding_mask).flatten(2).permute(2, 0, 1)
             src_i = self.input_proj[i](feature).flatten(2)
             src_i = src_i + self.level_embed.weight[i][None, :, None]
             src_i = src_i.permute(2, 0, 1)
 
             pos.append(pos_i)
             src.append(src_i)
+            padding_masks.append(nonempty_padding_mask(padding_mask))
 
         _, bs, _ = src[0].shape
         query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
@@ -224,7 +228,9 @@ class LatentTransformerDecoder(nn.Module):
         predictions_mask = []
         predictions_sig = []
         predictions_seed = []
-        _, _, _, _, attn_biases = self.forward_prediction_heads(output, multi_scale_features)
+        _, _, _, _, attn_biases = self.forward_prediction_heads(
+            output, multi_scale_features, padding_masks
+        )
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -235,13 +241,18 @@ class LatentTransformerDecoder(nn.Module):
                 i,
                 memory=src[level_index],
                 memory_mask=attn_bias,
+                memory_key_padding_mask=(
+                    padding_masks[level_index].flatten(1)
+                    if padding_masks[level_index] is not None
+                    else None
+                ),
                 pos=pos[level_index],
                 query_pos=query_pos,
             )
             history.append(output)
 
             outputs_class, outputs_mask, outputs_sig, outputs_seed, attn_biases = (
-                self.forward_prediction_heads(output, multi_scale_features)
+                self.forward_prediction_heads(output, multi_scale_features, padding_masks)
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -256,7 +267,7 @@ class LatentTransformerDecoder(nn.Module):
         }
         return out
 
-    def forward_prediction_heads(self, output, multi_scale_features):
+    def forward_prediction_heads(self, output, multi_scale_features, padding_masks=None):
         decoder_output = self.decoder_norm(output)
         outputs_class = self.class_embed(decoder_output)
         outputs_sig = self.sig_head(decoder_output)
@@ -264,12 +275,24 @@ class LatentTransformerDecoder(nn.Module):
 
         attn_biases = []
         mask_embed = self.mask_embed(decoder_output)
-        for feature in multi_scale_features:
+        if padding_masks is None:
+            padding_masks = [None] * len(multi_scale_features)
+        for feature, padding_mask in zip(multi_scale_features, padding_masks):
             output_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, feature)
             
             attn_bias = output_mask.flatten(2)
-            attn_bias = attn_bias - attn_bias.mean(dim=-1, keepdim=True)
-            attn_bias = attn_bias / attn_bias.std(dim=-1, keepdim=True, unbiased=False).clamp_min(self.attn_bias_eps)
+            if padding_mask is None:
+                attn_bias = attn_bias - attn_bias.mean(dim=-1, keepdim=True)
+                attn_bias = attn_bias / attn_bias.std(dim=-1, keepdim=True, unbiased=False).clamp_min(self.attn_bias_eps)
+            else:
+                flat_padding_mask = padding_mask.flatten(1)
+                valid = (~flat_padding_mask).to(dtype=attn_bias.dtype)[:, None, :]
+                denom = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                mean = (attn_bias * valid).sum(dim=-1, keepdim=True) / denom
+                centered = (attn_bias - mean) * valid
+                var = centered.square().sum(dim=-1, keepdim=True) / denom
+                attn_bias = centered / var.clamp_min(self.attn_bias_eps ** 2).sqrt()
+                attn_bias = attn_bias.masked_fill(flat_padding_mask[:, None, :], 0.0)
             attn_bias = (
                 attn_bias.unsqueeze(1)
                 .repeat(1, self.num_heads, 1, 1)

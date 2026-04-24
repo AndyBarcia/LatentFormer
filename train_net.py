@@ -27,6 +27,9 @@ import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog, build_detection_train_loader
+from detectron2.data.build import trivial_batch_collator
+from detectron2.data.common import DatasetFromList, MapDataset
+from detectron2.data.samplers import InferenceSampler
 from detectron2.data import build_detection_test_loader
 from detectron2.engine import (
     DefaultTrainer,
@@ -154,6 +157,24 @@ def _register_limited_test_datasets(cfg, limit):
     logger.info("Using limited evaluation datasets: %s", ", ".join(limited_names))
 
 
+def _build_detection_test_loader_with_batch_size(cfg, dataset_name, mapper):
+    dataset = DatasetFromList(DatasetCatalog.get(dataset_name), copy=False)
+    if mapper is not None:
+        dataset = MapDataset(dataset, mapper)
+    sampler = InferenceSampler(len(dataset))
+    batch_sampler = torch.utils.data.sampler.BatchSampler(
+        sampler,
+        cfg.TEST.IMS_PER_BATCH,
+        drop_last=False,
+    )
+    return torch.utils.data.DataLoader(
+        dataset,
+        num_workers=cfg.DATALOADER.NUM_WORKERS,
+        batch_sampler=batch_sampler,
+        collate_fn=trivial_batch_collator,
+    )
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
@@ -252,6 +273,8 @@ class Trainer(DefaultTrainer):
     def build_test_loader(cls, cfg, dataset_name):
         if cfg.INPUT.DATASET_MAPPER_NAME == "coco_panoptic_lsj":
             mapper = COCOPanopticNewBaselineDatasetMapper(cfg, False)
+            if cfg.TEST.IMS_PER_BATCH > 1:
+                return _build_detection_test_loader_with_batch_size(cfg, dataset_name, mapper)
             return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
         return super().build_test_loader(cfg, dataset_name)
 

@@ -17,6 +17,7 @@ from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 from ..transformer_decoder.position_encoding import PositionEmbeddingSine
 from ..transformer_decoder.transformer import _get_clones, _get_activation_fn
 from .ops.modules import MSDeformAttn
+from ...utils.padding import nonempty_padding_mask, resize_padding_mask
 
 
 # MSDeformAttn Transformer encoder in deformable detr
@@ -58,8 +59,12 @@ class MSDeformAttnTransformerEncoderOnly(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, pos_embeds):
-        masks = [torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool) for x in srcs]
+    def forward(self, srcs, pos_embeds, masks=None):
+        if masks is None:
+            masks = [
+                torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool)
+                for x in srcs
+            ]
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -312,16 +317,23 @@ class MSDeformAttnPixelDecoder(nn.Module):
         return ret
 
     @autocast(enabled=False)
-    def forward_features(self, features):
+    def forward_features(self, features, mask=None):
         srcs = []
         pos = []
+        masks = []
         # Reverse feature maps into top-down order (from low to high resolution)
         for idx, f in enumerate(self.transformer_in_features[::-1]):
             x = features[f].float()  # deformable detr does not support half precision
+            padding_mask = nonempty_padding_mask(resize_padding_mask(mask, x.shape[-2:]))
             srcs.append(self.input_proj[idx](x))
-            pos.append(self.pe_layer(x))
+            pos.append(self.pe_layer(x, padding_mask))
+            masks.append(
+                padding_mask
+                if padding_mask is not None
+                else torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool)
+            )
 
-        y, spatial_shapes, level_start_index = self.transformer(srcs, pos)
+        y, spatial_shapes, level_start_index = self.transformer(srcs, pos, masks)
         bs = y.shape[0]
 
         split_size_or_sections = [None] * self.transformer_num_feature_levels

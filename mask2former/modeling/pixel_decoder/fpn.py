@@ -15,6 +15,7 @@ from detectron2.layers import Conv2d, DeformConv, ShapeSpec, get_norm
 from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 
 from ..transformer_decoder.position_encoding import PositionEmbeddingSine
+from ...utils.padding import nonempty_padding_mask, resize_padding_mask
 from ..transformer_decoder.transformer import TransformerEncoder, TransformerEncoderLayer, _get_clones, _get_activation_fn
 
 
@@ -133,7 +134,7 @@ class BasePixelDecoder(nn.Module):
         ret["norm"] = cfg.MODEL.SEM_SEG_HEAD.NORM
         return ret
 
-    def forward_features(self, features):
+    def forward_features(self, features, mask=None):
         multi_scale_features = []
         num_cur_levels = 0
         # Reverse feature maps into top-down order (from low to high resolution)
@@ -281,7 +282,7 @@ class TransformerEncoderPixelDecoder(BasePixelDecoder):
         ret["transformer_pre_norm"] = cfg.MODEL.MASK_FORMER.PRE_NORM
         return ret
 
-    def forward_features(self, features):
+    def forward_features(self, features, mask=None):
         multi_scale_features = []
         num_cur_levels = 0
         # Reverse feature maps into top-down order (from low to high resolution)
@@ -291,8 +292,9 @@ class TransformerEncoderPixelDecoder(BasePixelDecoder):
             output_conv = self.output_convs[idx]
             if lateral_conv is None:
                 transformer = self.input_proj(x)
-                pos = self.pe_layer(x)
-                transformer = self.transformer(transformer, None, pos)
+                padding_mask = nonempty_padding_mask(resize_padding_mask(mask, x.shape[-2:]))
+                pos = self.pe_layer(x, padding_mask)
+                transformer = self.transformer(transformer, padding_mask, pos)
                 y = output_conv(transformer)
                 # save intermediate feature as input to Transformer decoder
                 transformer_encoder_features = transformer

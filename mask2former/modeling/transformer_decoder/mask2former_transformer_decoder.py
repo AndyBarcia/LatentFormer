@@ -12,6 +12,7 @@ from detectron2.layers import Conv2d
 
 from .position_encoding import PositionEmbeddingSine
 from .maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
+from ...utils.padding import nonempty_padding_mask, resize_padding_mask
 
 
 class SelfAttentionLayer(nn.Module):
@@ -366,14 +367,17 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         src = []
         pos = []
         size_list = []
-
-        # disable mask, it does not affect performance
-        del mask
+        memory_key_padding_masks = []
 
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
-            pos.append(self.pe_layer(x[i], None).flatten(2))
+            padding_mask = resize_padding_mask(mask, x[i].shape[-2:])
+            pos.append(self.pe_layer(x[i], padding_mask).flatten(2))
             src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            padding_mask = nonempty_padding_mask(padding_mask)
+            memory_key_padding_masks.append(
+                padding_mask.flatten(1) if padding_mask is not None else None
+            )
 
             # flatten NxCxHxW to HWxNxC
             pos[-1] = pos[-1].permute(2, 0, 1)
@@ -395,12 +399,22 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
-            attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            memory_key_padding_mask = memory_key_padding_masks[level_index]
+            if memory_key_padding_mask is None:
+                attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            else:
+                valid_memory = ~memory_key_padding_mask
+                valid_memory = (
+                    valid_memory[:, None, :]
+                    .repeat(1, self.num_heads, 1)
+                    .flatten(0, 1)
+                )
+                attn_mask[torch.where((attn_mask | ~valid_memory).all(-1))] = False
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                memory_key_padding_mask=memory_key_padding_mask,
                 pos=pos[level_index], query_pos=query_embed
             )
 
