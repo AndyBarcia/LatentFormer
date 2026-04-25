@@ -87,38 +87,45 @@ class ClusteringSeedSelection(SeedSelectionBase):
         q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
         q_seed_scores = q_seed_logits_flat.sigmoid()
 
+        selected_mask = q_seed_scores >= self.seed_threshold
+        empty_selection = ~selected_mask.any(dim=1)
+        if empty_selection.any():
+            fallback_indices = q_seed_scores.argmax(dim=1)
+            selected_mask = selected_mask.clone()
+            selected_mask[empty_selection, fallback_indices[empty_selection]] = True
+
+        similarity = pairwise_similarity(
+            q_sig_flat,
+            q_sig_flat,
+            metric=self.similarity_metric,
+        )
+        adjacency = similarity >= self.duplicate_threshold
+        adjacency = adjacency & selected_mask[:, :, None] & selected_mask[:, None, :]
+        query_indices = torch.arange(q_sig_flat.shape[1], device=q_sig_flat.device)
+        adjacency[:, query_indices, query_indices] = selected_mask
+
         batch_seed_signatures = []
         batch_seed_scores = []
         max_num_seeds = 0
 
-        for signatures_per_image, seed_scores_per_image in zip(q_sig_flat, q_seed_scores):
-            selected = torch.nonzero(
-                seed_scores_per_image >= self.seed_threshold,
-                as_tuple=False,
-            ).flatten()
-            if selected.numel() == 0:
-                selected = seed_scores_per_image.argmax().view(1)
-
-            selected_signatures = signatures_per_image[selected]
-            selected_scores = seed_scores_per_image[selected]
-
-            similarity = pairwise_similarity(
-                selected_signatures.unsqueeze(0),
-                selected_signatures.unsqueeze(0),
-                metric=self.similarity_metric,
-            ).squeeze(0)
-            adjacency = similarity >= self.duplicate_threshold
-            adjacency.fill_diagonal_(True)
-
-            components = self._connected_components(adjacency)
+        for signatures_per_image, seed_scores_per_image, selected, adjacency_per_image in zip(
+            q_sig_flat,
+            q_seed_scores,
+            selected_mask,
+            adjacency,
+        ):
+            selected = selected.nonzero(as_tuple=False).flatten()
+            selected_adjacency = adjacency_per_image[selected][:, selected]
+            components = self._connected_components(selected_adjacency)
             component_seed_signatures = []
             component_seed_scores = []
             for component in components:
                 component_indices = selected.new_tensor(component, dtype=torch.long)
-                component_scores = selected_scores[component_indices]
-                best_idx = component_indices[component_scores.argmax()]
-                component_seed_signatures.append(selected_signatures[best_idx])
-                component_seed_scores.append(selected_scores[best_idx])
+                component_query_indices = selected[component_indices]
+                component_scores = seed_scores_per_image[component_query_indices]
+                best_idx = component_query_indices[component_scores.argmax()]
+                component_seed_signatures.append(signatures_per_image[best_idx])
+                component_seed_scores.append(seed_scores_per_image[best_idx])
 
             image_seed_signatures = torch.stack(component_seed_signatures, dim=0)
             image_seed_scores = torch.stack(component_seed_scores, dim=0)
