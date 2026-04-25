@@ -12,6 +12,15 @@ try:
 except:
     pass
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"`torch\.cuda\.amp\.autocast\(args\.\.\.\)` is deprecated.*",
+    module=r"detectron2\.engine\.train_loop",
+)
+
 import copy
 import itertools
 import json
