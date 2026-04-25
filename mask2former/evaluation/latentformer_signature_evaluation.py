@@ -1,11 +1,13 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import json
+import logging
 import os
 
 from collections import OrderedDict, defaultdict
 
 import torch
 from scipy.optimize import linear_sum_assignment
+from tabulate import tabulate
 
 import detectron2.utils.comm as comm
 from detectron2.evaluation.evaluator import DatasetEvaluator
@@ -17,6 +19,7 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
     def __init__(self, similarity_metric, output_dir=None):
         self.similarity_metric = similarity_metric
         self._output_dir = output_dir
+        self._logger = logging.getLogger(__name__)
         self.reset()
 
     def reset(self):
@@ -99,6 +102,7 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
                     merged[bucket][metric_name].extend(values)
 
         results = OrderedDict()
+        table_rows = []
         for bucket in sorted(merged.keys()):
             for metric_name in (
                 "gt_gt",
@@ -111,17 +115,43 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
                 prefix = f"{bucket}/{metric_name}"
                 results[f"{prefix}_count"] = int(values.numel())
                 if values.numel() == 0:
-                    results[f"{prefix}_avg"] = float("nan")
-                    results[f"{prefix}_dev"] = float("nan")
-                    results[f"{prefix}_min"] = float("nan")
-                    results[f"{prefix}_p50"] = float("nan")
-                    results[f"{prefix}_max"] = float("nan")
+                    avg = dev = min_value = p50 = max_value = float("nan")
                 else:
-                    results[f"{prefix}_avg"] = float(values.mean().item())
-                    results[f"{prefix}_dev"] = float(values.std(unbiased=False).item())
-                    results[f"{prefix}_min"] = float(values.min().item())
-                    results[f"{prefix}_p50"] = float(values.quantile(0.5).item())
-                    results[f"{prefix}_max"] = float(values.max().item())
+                    avg = float(values.mean().item())
+                    dev = float(values.std(unbiased=False).item())
+                    min_value = float(values.min().item())
+                    p50 = float(values.quantile(0.5).item())
+                    max_value = float(values.max().item())
+
+                results[f"{prefix}_avg"] = avg
+                results[f"{prefix}_dev"] = dev
+                results[f"{prefix}_min"] = min_value
+                results[f"{prefix}_p50"] = p50
+                results[f"{prefix}_max"] = max_value
+                table_rows.append(
+                    [
+                        bucket,
+                        metric_name,
+                        int(values.numel()),
+                        avg,
+                        dev,
+                        min_value,
+                        p50,
+                        max_value,
+                    ]
+                )
+
+        if table_rows:
+            headers = ["Bucket", "Metric", "Count", "Avg", "Dev", "Min", "P50", "Max"]
+            table = tabulate(
+                table_rows,
+                headers=headers,
+                tablefmt="pipe",
+                floatfmt=".3f",
+                stralign="center",
+                numalign="center",
+            )
+            self._logger.info("LatentFormer Signature Evaluation Results:\n" + table)
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
