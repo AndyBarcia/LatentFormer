@@ -356,152 +356,244 @@ class LatentFormer(nn.Module):
             align_corners=False,
         )
 
-        processed_results = []
-        for mask_cls_result, mask_pred_result, pad_mask_per_image, input_per_image, image_size in zip(
-            proto_cls,
+        mask_pred_results, output_sizes = self._prepare_batched_mask_predictions(
             mask_pred_results,
-            seed_pad_mask,
             batched_inputs,
             image_sizes,
+        )
+        proto_cls = proto_cls.to(mask_pred_results)
+        spatial_valid_mask = self._spatial_valid_mask(output_sizes, mask_pred_results)
+
+        processed_results = [{} for _ in batched_inputs]
+        sem_seg_results = None
+        panoptic_results = None
+        instance_results = None
+        if self.semantic_on:
+            sem_seg_results = retry_if_cuda_oom(self.batched_semantic_inference)(
+                proto_cls,
+                mask_pred_results,
+                seed_pad_mask,
+            )
+            sem_seg_results = sem_seg_results * spatial_valid_mask[:, None].to(dtype=sem_seg_results.dtype)
+        if self.panoptic_on:
+            panoptic_results = retry_if_cuda_oom(self.batched_panoptic_inference)(
+                proto_cls,
+                mask_pred_results,
+                seed_pad_mask,
+                spatial_valid_mask,
+            )
+        if self.instance_on:
+            instance_results = retry_if_cuda_oom(self.batched_instance_inference)(
+                proto_cls,
+                mask_pred_results,
+                seed_pad_mask,
+                spatial_valid_mask,
+            )
+
+        for idx, (input_per_image, image_size, output_size) in enumerate(
+            zip(batched_inputs, image_sizes, output_sizes)
         ):
             height = input_per_image.get("height", image_size[0])
             width = input_per_image.get("width", image_size[1])
-            processed_results.append({})
+            out_h, out_w = output_size
 
-            valid_mask_cls = mask_cls_result[pad_mask_per_image]
-            valid_mask_pred = mask_pred_result[pad_mask_per_image]
-
-            if self.sem_seg_postprocess_before_inference:
-                valid_mask_pred = retry_if_cuda_oom(sem_seg_postprocess)(
-                    valid_mask_pred,
-                    image_size,
-                    height,
-                    width,
-                )
-                valid_mask_cls = valid_mask_cls.to(valid_mask_pred)
-
-            if self.semantic_on:
-                sem_seg = retry_if_cuda_oom(self.semantic_inference)(valid_mask_cls, valid_mask_pred)
+            if sem_seg_results is not None:
+                sem_seg = sem_seg_results[idx, :, :out_h, :out_w]
                 if not self.sem_seg_postprocess_before_inference:
                     sem_seg = retry_if_cuda_oom(sem_seg_postprocess)(sem_seg, image_size, height, width)
-                processed_results[-1]["sem_seg"] = sem_seg
+                processed_results[idx]["sem_seg"] = sem_seg
 
-            if self.panoptic_on:
-                processed_results[-1]["panoptic_seg"] = retry_if_cuda_oom(self.panoptic_inference)(
-                    valid_mask_cls,
-                    valid_mask_pred,
+            if panoptic_results is not None:
+                panoptic_seg, segments_info = panoptic_results[idx]
+                processed_results[idx]["panoptic_seg"] = (
+                    panoptic_seg[:out_h, :out_w],
+                    segments_info,
                 )
 
-            if self.instance_on:
-                processed_results[-1]["instances"] = retry_if_cuda_oom(self.instance_inference)(
-                    valid_mask_cls,
-                    valid_mask_pred,
-                )
+            if instance_results is not None:
+                instances = instance_results[idx]
+                cropped_instances = Instances((out_h, out_w))
+                cropped_instances.pred_masks = instances.pred_masks[:, :out_h, :out_w]
+                cropped_instances.pred_boxes = instances.pred_boxes
+                cropped_instances.scores = instances.scores
+                cropped_instances.pred_classes = instances.pred_classes
+                processed_results[idx]["instances"] = cropped_instances
 
         return processed_results
 
-    def semantic_inference(self, mask_cls, mask_pred):
-        if mask_cls.shape[0] == 0:
-            return mask_pred.new_zeros((self.sem_seg_head.num_classes, *mask_pred.shape[-2:]))
-        class_probs = F.softmax(mask_cls, dim=-1)[..., :-1]
-        mask_probs = F.softmax(mask_pred, dim=0)
-        return torch.einsum("qc,qhw->chw", class_probs, mask_probs)
+    def _prepare_batched_mask_predictions(self, mask_pred_results, batched_inputs, image_sizes):
+        if not self.sem_seg_postprocess_before_inference:
+            return mask_pred_results, list(image_sizes)
 
-    def panoptic_inference(self, mask_cls, mask_pred):
-        if mask_cls.shape[0] == 0:
-            h, w = mask_pred.shape[-2:]
-            return torch.zeros((h, w), dtype=torch.int32, device=mask_pred.device), []
+        output_sizes = [
+            (
+                input_per_image.get("height", image_size[0]),
+                input_per_image.get("width", image_size[1]),
+            )
+            for input_per_image, image_size in zip(batched_inputs, image_sizes)
+        ]
+        max_h = max(height for height, _ in output_sizes)
+        max_w = max(width for _, width in output_sizes)
+        batched_masks = mask_pred_results.new_zeros(
+            (mask_pred_results.shape[0], mask_pred_results.shape[1], max_h, max_w)
+        )
+
+        for idx, (mask_pred_result, image_size, output_size) in enumerate(
+            zip(mask_pred_results, image_sizes, output_sizes)
+        ):
+            resized = retry_if_cuda_oom(sem_seg_postprocess)(
+                mask_pred_result,
+                image_size,
+                output_size[0],
+                output_size[1],
+            )
+            batched_masks[idx, :, : output_size[0], : output_size[1]] = resized
+
+        return batched_masks, output_sizes
+
+    def _spatial_valid_mask(self, output_sizes, mask_pred_results):
+        mask = torch.zeros(
+            (mask_pred_results.shape[0], mask_pred_results.shape[-2], mask_pred_results.shape[-1]),
+            dtype=torch.bool,
+            device=mask_pred_results.device,
+        )
+        for idx, (height, width) in enumerate(output_sizes):
+            mask[idx, :height, :width] = True
+        return mask
+
+    def _masked_seed_softmax(self, mask_pred, seed_pad_mask):
+        mask_logits = mask_pred.masked_fill(~seed_pad_mask[:, :, None, None], torch.finfo(mask_pred.dtype).min)
+        return F.softmax(mask_logits, dim=1)
+
+    def batched_semantic_inference(self, mask_cls, mask_pred, seed_pad_mask):
+        if mask_cls.shape[1] == 0:
+            return mask_pred.new_zeros((mask_pred.shape[0], self.sem_seg_head.num_classes, *mask_pred.shape[-2:]))
+        class_probs = F.softmax(mask_cls, dim=-1)[..., :-1]
+        class_probs = class_probs * seed_pad_mask[:, :, None].to(dtype=class_probs.dtype)
+        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        return torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+
+    def batched_panoptic_inference(self, mask_cls, mask_pred, seed_pad_mask, spatial_valid_mask):
+        batch_size, _, height, width = mask_pred.shape
+        if mask_cls.shape[1] == 0:
+            empty = mask_pred.new_zeros((height, width), dtype=torch.int32)
+            return [(empty.clone(), []) for _ in range(batch_size)]
 
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
-        mask_probs = F.softmax(mask_pred, dim=0)
+        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        keep = (
+            seed_pad_mask
+            & labels.ne(self.sem_seg_head.num_classes)
+            & (scores > self.score_threshold)
+        )
+        prob_masks = scores[:, :, None, None] * mask_probs
+        prob_masks = prob_masks.masked_fill(~keep[:, :, None, None], -1.0)
+        prob_masks = prob_masks.masked_fill(~spatial_valid_mask[:, None], -1.0)
+        mask_ids = prob_masks.argmax(dim=1)
+        seed_ids = torch.arange(mask_cls.shape[1], device=mask_pred.device)
+        assigned_masks = (mask_ids[:, None] == seed_ids[None, :, None, None]) & spatial_valid_mask[:, None]
+        final_masks = assigned_masks & (mask_probs >= 0.5)
+        mask_areas = assigned_masks.flatten(2).sum(2)
+        original_areas = ((mask_probs >= 0.5) & spatial_valid_mask[:, None]).flatten(2).sum(2)
+        final_areas = final_masks.flatten(2).sum(2)
 
-        keep = labels.ne(self.sem_seg_head.num_classes) & (scores > self.score_threshold)
-        cur_scores = scores[keep]
-        cur_classes = labels[keep]
-        cur_masks = mask_probs[keep]
+        results = []
+        thing_ids = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
+        for batch_idx in range(batch_size):
+            panoptic_seg = torch.zeros((height, width), dtype=torch.int32, device=mask_pred.device)
+            segments_info = []
+            current_segment_id = 0
+            stuff_memory_list = {}
 
-        h, w = cur_masks.shape[-2:]
-        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
-        segments_info = []
-        current_segment_id = 0
+            kept_seed_indices = keep[batch_idx].nonzero(as_tuple=False).flatten()
+            for seed_idx in kept_seed_indices:
+                pred_class = labels[batch_idx, seed_idx].item()
+                isthing = pred_class in thing_ids
+                mask_area = mask_areas[batch_idx, seed_idx].item()
+                original_area = original_areas[batch_idx, seed_idx].item()
+                final_area = final_areas[batch_idx, seed_idx].item()
+                mask = final_masks[batch_idx, seed_idx]
 
-        if cur_masks.shape[0] == 0:
-            return panoptic_seg, segments_info
-
-        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
-        cur_mask_ids = cur_prob_masks.argmax(0)
-        stuff_memory_list = {}
-        for k in range(cur_classes.shape[0]):
-            pred_class = cur_classes[k].item()
-            isthing = pred_class in self.metadata.thing_dataset_id_to_contiguous_id.values()
-            mask_area = (cur_mask_ids == k).sum().item()
-            original_area = (cur_masks[k] >= 0.5).sum().item()
-            mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
-
-            if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
-                if mask_area / original_area < self.overlap_threshold:
-                    continue
-
-                if not isthing:
-                    if int(pred_class) in stuff_memory_list:
-                        panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                if mask_area > 0 and original_area > 0 and final_area > 0:
+                    if mask_area / original_area < self.overlap_threshold:
                         continue
-                    stuff_memory_list[int(pred_class)] = current_segment_id + 1
 
-                current_segment_id += 1
-                panoptic_seg[mask] = current_segment_id
-                segments_info.append(
-                    {
-                        "id": current_segment_id,
-                        "isthing": bool(isthing),
-                        "category_id": int(pred_class),
-                    }
-                )
+                    if not isthing:
+                        if int(pred_class) in stuff_memory_list:
+                            panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                            continue
+                        stuff_memory_list[int(pred_class)] = current_segment_id + 1
 
-        return panoptic_seg, segments_info
+                    current_segment_id += 1
+                    panoptic_seg[mask] = current_segment_id
+                    segments_info.append(
+                        {
+                            "id": current_segment_id,
+                            "isthing": bool(isthing),
+                            "category_id": int(pred_class),
+                        }
+                    )
 
-    def instance_inference(self, mask_cls, mask_pred):
-        image_size = mask_pred.shape[-2:]
-        if mask_cls.shape[0] == 0:
-            result = Instances(image_size)
-            result.pred_masks = torch.zeros((0, *image_size), dtype=mask_pred.dtype, device=mask_pred.device)
-            result.pred_boxes = Boxes(torch.zeros((0, 4), dtype=mask_pred.dtype, device=mask_pred.device))
-            result.scores = torch.zeros((0,), dtype=mask_pred.dtype, device=mask_pred.device)
-            result.pred_classes = torch.zeros((0,), dtype=torch.long, device=mask_pred.device)
-            return result
+            results.append((panoptic_seg, segments_info))
 
-        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
-        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(
-            mask_cls.shape[0], 1
-        ).flatten(0, 1)
-        scores_per_image, topk_indices = scores.flatten(0, 1).topk(
-            min(self.test_topk_per_image, scores.numel()),
-            sorted=False,
+        return results
+
+    def batched_instance_inference(self, mask_cls, mask_pred, seed_pad_mask, spatial_valid_mask):
+        batch_size, num_seeds, height, width = mask_pred.shape
+        image_size = (height, width)
+        if num_seeds == 0:
+            return [self._empty_instances(image_size, mask_pred) for _ in range(batch_size)]
+
+        scores = F.softmax(mask_cls, dim=-1)[:, :, :-1]
+        scores = scores.masked_fill(~seed_pad_mask[:, :, None], -1.0)
+        k = min(self.test_topk_per_image, scores.shape[1] * scores.shape[2])
+        scores_per_image, topk_indices = scores.flatten(1, 2).topk(k, dim=1, sorted=False)
+        labels_per_image = topk_indices % self.sem_seg_head.num_classes
+        seed_indices = topk_indices // self.sem_seg_head.num_classes
+        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        selected_masks = mask_probs.gather(
+            1,
+            seed_indices[:, :, None, None].expand(-1, -1, height, width),
         )
-        labels_per_image = labels[topk_indices]
-        topk_indices = topk_indices // self.sem_seg_head.num_classes
-        mask_probs = F.softmax(mask_pred, dim=0)[topk_indices]
-
-        keep = scores_per_image > self.score_threshold
-        if self.panoptic_on:
-            for idx, label in enumerate(labels_per_image):
-                keep[idx] = keep[idx] & (
-                    label in self.metadata.thing_dataset_id_to_contiguous_id.values()
-                )
-
-        scores_per_image = scores_per_image[keep]
-        labels_per_image = labels_per_image[keep]
-        mask_probs = mask_probs[keep]
-
-        result = Instances(image_size)
-        result.pred_masks = (mask_probs >= 0.5).float()
-        result.pred_boxes = Boxes(torch.zeros((mask_probs.size(0), 4), dtype=mask_probs.dtype, device=mask_probs.device))
+        selected_masks = selected_masks * spatial_valid_mask[:, None].to(dtype=selected_masks.dtype)
+        pred_masks = ((selected_masks >= 0.5) & spatial_valid_mask[:, None]).float()
         mask_scores_per_image = (
-            (mask_probs * result.pred_masks).flatten(1).sum(1)
-            / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+            (selected_masks * pred_masks).flatten(2).sum(2)
+            / (pred_masks.flatten(2).sum(2) + 1e-6)
         )
-        result.scores = scores_per_image * mask_scores_per_image
-        result.pred_classes = labels_per_image
+        scores_per_image = scores_per_image * mask_scores_per_image
+
+        thing_class_mask = torch.zeros(self.sem_seg_head.num_classes, dtype=torch.bool, device=mask_pred.device)
+        thing_class_mask[
+            torch.tensor(
+                list(self.metadata.thing_dataset_id_to_contiguous_id.values()),
+                dtype=torch.long,
+                device=mask_pred.device,
+            )
+        ] = True
+        results = []
+        for batch_idx in range(batch_size):
+            keep = scores_per_image[batch_idx] > self.score_threshold
+            if self.panoptic_on:
+                keep = keep & thing_class_mask[labels_per_image[batch_idx]]
+
+            result = Instances(image_size)
+            result.pred_masks = pred_masks[batch_idx, keep]
+            result.pred_boxes = Boxes(
+                torch.zeros((result.pred_masks.shape[0], 4), dtype=mask_pred.dtype, device=mask_pred.device)
+            )
+            result.scores = scores_per_image[batch_idx, keep]
+            result.pred_classes = labels_per_image[batch_idx, keep]
+            results.append(result)
+
+        return results
+
+    def _empty_instances(self, image_size, mask_pred):
+        result = Instances(image_size)
+        result.pred_masks = torch.zeros((0, *image_size), dtype=mask_pred.dtype, device=mask_pred.device)
+        result.pred_boxes = Boxes(torch.zeros((0, 4), dtype=mask_pred.dtype, device=mask_pred.device))
+        result.scores = torch.zeros((0,), dtype=mask_pred.dtype, device=mask_pred.device)
+        result.pred_classes = torch.zeros((0,), dtype=torch.long, device=mask_pred.device)
         return result
 
     def prepare_gt_encoder_inputs(self, targets, images):
