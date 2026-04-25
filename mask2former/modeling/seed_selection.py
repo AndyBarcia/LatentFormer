@@ -1,4 +1,5 @@
 import torch
+from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 from .similarity import pairwise_similarity
@@ -154,7 +155,7 @@ SeedSelection = ClusteringSeedSelection
 
 
 class GoldenSeedSelection(SeedSelectionBase):
-    """Use GT signatures to choose the closest predicted query for each GT object."""
+    """Use one-to-one matching to choose the closest predicted query for each GT object."""
 
     requires_gt_signatures = True
 
@@ -179,13 +180,26 @@ class GoldenSeedSelection(SeedSelectionBase):
             gt_signatures,
             metric=self.similarity_metric,
         )
-        sim = sim.masked_fill(~gt_pad_mask[:, None, :], float("-inf"))
-        best_query = sim.argmax(dim=1)
-        gather_idx = best_query[:, :, None].expand(-1, -1, q_sig_flat.shape[-1])
-        seed_signatures = q_sig_flat.gather(1, gather_idx) * gt_pad_mask[:, :, None].to(
-            dtype=q_sig_flat.dtype
-        )
-        seed_scores = q_seed_logits_flat.sigmoid().gather(1, best_query).masked_fill(~gt_pad_mask, 0.0)
+        seed_signatures = q_sig_flat.new_zeros(gt_signatures.shape)
+        seed_scores = q_seed_logits_flat.new_zeros(gt_pad_mask.shape)
+
+        for batch_idx in range(q_sig_flat.shape[0]):
+            valid_gt_idx = gt_pad_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            if valid_gt_idx.numel() == 0:
+                continue
+
+            cost = 1.0 - sim[batch_idx, :, valid_gt_idx]
+            row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+            if len(row_ind) == 0:
+                continue
+
+            query_idx = torch.as_tensor(row_ind, device=q_sig_flat.device, dtype=torch.long)
+            gt_idx = valid_gt_idx[
+                torch.as_tensor(col_ind, device=q_sig_flat.device, dtype=torch.long)
+            ]
+            seed_signatures[batch_idx, gt_idx] = q_sig_flat[batch_idx, query_idx]
+            seed_scores[batch_idx, gt_idx] = q_seed_logits_flat[batch_idx, query_idx].sigmoid()
+
         return seed_signatures, gt_pad_mask, seed_scores
 
 
