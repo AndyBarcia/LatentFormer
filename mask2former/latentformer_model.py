@@ -428,10 +428,8 @@ class LatentFormer(nn.Module):
 
             if self.signature_on and targets is not None and "gt_signatures" in outputs:
                 gt_pad_mask = targets["pad_mask"][idx]
-                gt_labels = targets["labels"][idx]
-                object_gt_mask = gt_pad_mask & gt_labels.ne(self.gt_encoder.background_label)
                 processed_results[idx]["latentformer_signature_eval"] = {
-                    "gt_signatures": outputs["gt_signatures"][idx, object_gt_mask].detach().cpu(),
+                    "gt_signatures": outputs["gt_signatures"][idx, gt_pad_mask].detach().cpu(),
                     "det_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
                     "det_seed_scores": seed_scores[idx, seed_pad_mask[idx]].detach().cpu(),
                 }
@@ -504,7 +502,7 @@ class LatentFormer(nn.Module):
             & (scores > self.score_threshold)
         )
         prob_masks = scores[:, :, None, None] * mask_probs
-        prob_masks = prob_masks.masked_fill(~keep[:, :, None, None], -1.0)
+        prob_masks = prob_masks.masked_fill(~seed_pad_mask[:, :, None, None], -1.0)
         prob_masks = prob_masks.masked_fill(~spatial_valid_mask[:, None], -1.0)
         mask_ids = prob_masks.argmax(dim=1)
         seed_ids = torch.arange(mask_cls.shape[1], device=mask_pred.device)
