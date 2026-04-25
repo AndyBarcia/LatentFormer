@@ -235,17 +235,22 @@ class LatentTransformerDecoder(nn.Module):
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_bias = attn_biases[level_index]
+            memory_key_padding_mask = (
+                padding_masks[level_index].flatten(1)
+                if padding_masks[level_index] is not None
+                else None
+            )
+            if memory_key_padding_mask is not None:
+                memory_key_padding_mask = torch.zeros_like(
+                    memory_key_padding_mask, dtype=attn_bias.dtype
+                ).masked_fill(memory_key_padding_mask, float("-inf"))
 
             output = self.decoder.forward_layer(
                 history,
                 i,
                 memory=src[level_index],
                 memory_mask=attn_bias,
-                memory_key_padding_mask=(
-                    padding_masks[level_index].flatten(1)
-                    if padding_masks[level_index] is not None
-                    else None
-                ),
+                memory_key_padding_mask=memory_key_padding_mask,
                 pos=pos[level_index],
                 query_pos=query_pos,
             )
