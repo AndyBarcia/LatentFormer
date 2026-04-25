@@ -4,6 +4,7 @@ from typing import Dict, Iterable, Optional, Sequence, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.cuda.amp import autocast
 
 
 class GroundTruthEncoder(nn.Module):
@@ -57,21 +58,33 @@ class GroundTruthEncoder(nn.Module):
         pad_mask: torch.Tensor,
     ) -> torch.Tensor:
         _, _, height, width = feature_map.shape
-        valid = pad_mask[:, :, None, None].to(dtype=feature_map.dtype)
-        masks_small = F.interpolate(
-            masks.float(), size=(height, width), mode="bilinear", align_corners=False
-        )
-        masks_small = masks_small * valid
+        # These reductions sum over full feature maps (for example 128x128). Under AMP,
+        # the intermediate sums can overflow fp16 even when every input value is finite,
+        # which then poisons GT signatures. Keep the pooling/projection path in fp32.
+        with autocast(enabled=False):
+            feature_map_float = feature_map.float()
+            masks_float = masks.float()
+            valid = pad_mask[:, :, None, None].to(dtype=feature_map_float.dtype)
+            masks_small = F.interpolate(
+                masks_float, size=(height, width), mode="bilinear", align_corners=False
+            )
+            masks_small = masks_small * valid
 
-        inside_denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
-        pooled_inside = torch.einsum("bmhw,bchw->bmc", masks_small, feature_map) / inside_denom
+            inside_denom = masks_small.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+            pooled_inside = (
+                torch.einsum("bmhw,bchw->bmc", masks_small, feature_map_float) / inside_denom
+            )
 
-        outside_masks = (1.0 - masks_small) * valid
-        outside_denom = outside_masks.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
-        pooled_outside = torch.einsum("bmhw,bchw->bmc", outside_masks, feature_map) / outside_denom
+            outside_masks = (1.0 - masks_small) * valid
+            outside_denom = outside_masks.flatten(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+            pooled_outside = (
+                torch.einsum("bmhw,bchw->bmc", outside_masks, feature_map_float) / outside_denom
+            )
 
-        pooled_context = torch.cat([pooled_inside, pooled_outside], dim=-1)
-        return self.gt_mask_context_proj(pooled_context)
+            pooled_context = torch.cat([pooled_inside, pooled_outside], dim=-1)
+            projected_context = self.gt_mask_context_proj(pooled_context)
+
+        return projected_context
 
     def forward(
         self,
