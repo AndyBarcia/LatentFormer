@@ -66,6 +66,7 @@ from mask2former import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
+    LatentFormerSignatureEvaluator,
     MaskFormerInstanceDatasetMapper,
     MaskFormerPanopticDatasetMapper,
     MaskFormerSemanticDatasetMapper,
@@ -209,6 +210,16 @@ class Trainer(DefaultTrainer):
         model_test_cfg = cls._model_test_cfg(cfg)
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        if (
+            cfg.MODEL.META_ARCHITECTURE == "LatentFormer"
+            and cfg.MODEL.LATENT_FORMER.TEST.SIGNATURE_ON
+        ):
+            evaluator_list.append(
+                LatentFormerSignatureEvaluator(
+                    cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
+                    output_dir=output_folder,
+                )
+            )
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -467,9 +478,12 @@ def setup(args):
     cfg.merge_from_list(args.opts)
     if (
         cfg.MODEL.META_ARCHITECTURE == "LatentFormer"
-        and any(
-            mode in {"GoldenSeedSelection", "GTOracleSeedSelection"}
-            for mode in cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES
+        and (
+            cfg.MODEL.LATENT_FORMER.TEST.SIGNATURE_ON
+            or any(
+                mode in {"GoldenSeedSelection", "GTOracleSeedSelection"}
+                for mode in cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES
+            )
         )
     ):
         cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL = True

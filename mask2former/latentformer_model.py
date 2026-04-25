@@ -131,6 +131,7 @@ class LatentFormer(nn.Module):
         test_topk_per_image: int,
         score_threshold: float,
         overlap_threshold: float,
+        signature_on: bool,
     ):
         super().__init__()
         self.backbone = backbone
@@ -155,6 +156,7 @@ class LatentFormer(nn.Module):
         self.test_topk_per_image = test_topk_per_image
         self.score_threshold = score_threshold
         self.overlap_threshold = overlap_threshold
+        self.signature_on = signature_on
 
     @classmethod
     def from_config(cls, cfg):
@@ -229,6 +231,7 @@ class LatentFormer(nn.Module):
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "score_threshold": cfg.MODEL.LATENT_FORMER.TEST.SCORE_THRESHOLD,
             "overlap_threshold": cfg.MODEL.LATENT_FORMER.TEST.OVERLAP_THRESHOLD,
+            "signature_on": cfg.MODEL.LATENT_FORMER.TEST.SIGNATURE_ON,
         }
 
     @property
@@ -282,7 +285,7 @@ class LatentFormer(nn.Module):
             )
 
     def _needs_gt_signatures(self):
-        return self.training or any(
+        return self.training or self.signature_on or any(
             seed_selection.requires_gt_signatures
             for seed_selection in self.seed_selection_modules.values()
         )
@@ -324,6 +327,7 @@ class LatentFormer(nn.Module):
                 padded_image_size,
                 seed_signatures,
                 seed_pad_mask,
+                targets=targets,
             )
 
         if len(mode_results) == 1:
@@ -338,6 +342,7 @@ class LatentFormer(nn.Module):
         padded_image_size,
         seed_signatures,
         seed_pad_mask,
+        targets=None,
     ):
         proto_cls, proto_masks, _ = self.aggregator(
             outputs["pred_logits"],
@@ -418,6 +423,15 @@ class LatentFormer(nn.Module):
                 cropped_instances.scores = instances.scores
                 cropped_instances.pred_classes = instances.pred_classes
                 processed_results[idx]["instances"] = cropped_instances
+
+            if self.signature_on and targets is not None and "gt_signatures" in outputs:
+                gt_pad_mask = targets["pad_mask"][idx]
+                gt_labels = targets["labels"][idx]
+                object_gt_mask = gt_pad_mask & gt_labels.ne(self.gt_encoder.background_label)
+                processed_results[idx]["latentformer_signature_eval"] = {
+                    "gt_signatures": outputs["gt_signatures"][idx, object_gt_mask].detach().cpu(),
+                    "det_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
+                }
 
         return processed_results
 

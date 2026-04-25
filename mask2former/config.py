@@ -168,6 +168,7 @@ def add_latentformer_config(cfg):
         "GTOracleSeedSelection",
     )
     cfg.MODEL.LATENT_FORMER.TEST.LOAD_GT_FOR_EVAL = False
+    cfg.MODEL.LATENT_FORMER.TEST.SIGNATURE_ON = True
 
     cfg.TEST.EVAL_MAX_IMAGES = 0
     cfg.TEST.IMS_PER_BATCH = 1

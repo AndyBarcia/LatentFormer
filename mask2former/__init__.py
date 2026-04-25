@@ -25,3 +25,4 @@ from .test_time_augmentation import SemanticSegmentorWithTTA
 
 # evaluation
 from .evaluation.instance_evaluation import InstanceSegEvaluator
+from .evaluation.latentformer_signature_evaluation import LatentFormerSignatureEvaluator
