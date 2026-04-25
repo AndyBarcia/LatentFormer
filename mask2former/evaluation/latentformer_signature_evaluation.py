@@ -15,6 +15,14 @@ from detectron2.evaluation.evaluator import DatasetEvaluator
 from mask2former.modeling.similarity import pairwise_distance
 
 
+def _signature_bucket_name(num_gt):
+    if num_gt == 0:
+        return "gt_000"
+    bucket_start = ((num_gt - 1) // 10) * 10 + 1
+    bucket_end = bucket_start + 9
+    return f"gt_{bucket_start:03d}_{bucket_end:03d}"
+
+
 class LatentFormerSignatureEvaluator(DatasetEvaluator):
     def __init__(self, similarity_metric, output_dir=None):
         self.similarity_metric = similarity_metric
@@ -37,11 +45,14 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
             if det_seed_scores is not None:
                 det_seed_scores = det_seed_scores.float()
             num_gt = int(gt_signatures.shape[0])
-            bucket = f"gt_{num_gt:03d}"
+            bucket = _signature_bucket_name(num_gt)
             self._add_image_stats("all", gt_signatures, det_signatures, det_seed_scores)
             self._add_image_stats(bucket, gt_signatures, det_signatures, det_seed_scores)
 
     def _add_image_stats(self, bucket, gt_signatures, det_signatures, det_seed_scores=None):
+        num_gt = int(gt_signatures.shape[0])
+        num_det = int(det_signatures.shape[0])
+
         if gt_signatures.shape[0] >= 2:
             gt_dist = pairwise_distance(
                 gt_signatures,
@@ -57,6 +68,13 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
             self._stats[bucket]["gt_gt"].extend(gt_dist[rows, cols].tolist())
 
         if gt_signatures.shape[0] == 0 or det_signatures.shape[0] == 0:
+            self._stats[bucket]["num_gt"].append(num_gt)
+            self._stats[bucket]["num_det"].append(num_det)
+            self._stats[bucket]["num_matched_det"].append(0)
+            self._stats[bucket]["num_unmatched_det"].append(num_det)
+            self._stats[bucket]["num_missed_gt"].append(num_gt)
+            if det_seed_scores is not None and num_det > 0:
+                self._stats[bucket]["unmatched_det_seed_score"].extend(det_seed_scores.tolist())
             return
 
         det_gt_dist = pairwise_distance(
@@ -67,6 +85,19 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
         cost = det_gt_dist.detach().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost)
         matched_det = set(row_ind.tolist())
+        matched_gt = set(col_ind.tolist())
+        unmatched_det = [
+            det_idx for det_idx in range(det_signatures.shape[0]) if det_idx not in matched_det
+        ]
+        missed_gt = [
+            gt_idx for gt_idx in range(gt_signatures.shape[0]) if gt_idx not in matched_gt
+        ]
+
+        self._stats[bucket]["num_gt"].append(num_gt)
+        self._stats[bucket]["num_det"].append(num_det)
+        self._stats[bucket]["num_matched_det"].append(len(matched_det))
+        self._stats[bucket]["num_unmatched_det"].append(len(unmatched_det))
+        self._stats[bucket]["num_missed_gt"].append(len(missed_gt))
         if len(row_ind) > 0:
             self._stats[bucket]["matched_det_gt"].extend(
                 cost[row_ind, col_ind].astype(float).tolist()
@@ -75,9 +106,6 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
                 matched_scores = det_seed_scores[row_ind]
                 self._stats[bucket]["matched_det_seed_score"].extend(matched_scores.tolist())
 
-        unmatched_det = [
-            det_idx for det_idx in range(det_signatures.shape[0]) if det_idx not in matched_det
-        ]
         if unmatched_det:
             nearest_unmatched = det_gt_dist[unmatched_det].min(dim=1).values
             self._stats[bucket]["unmatched_det_gt"].extend(nearest_unmatched.tolist())
@@ -85,6 +113,10 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
                 self._stats[bucket]["unmatched_det_seed_score"].extend(
                     det_seed_scores[unmatched_det].tolist()
                 )
+
+        if missed_gt:
+            nearest_missed = det_gt_dist[:, missed_gt].min(dim=0).values
+            self._stats[bucket]["missed_gt_det"].extend(nearest_missed.tolist())
 
     def evaluate(self):
         local_stats = {
@@ -105,9 +137,15 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
         table_rows = []
         for bucket in sorted(merged.keys()):
             for metric_name in (
+                "num_gt",
+                "num_det",
+                "num_matched_det",
+                "num_unmatched_det",
+                "num_missed_gt",
                 "gt_gt",
                 "matched_det_gt",
                 "unmatched_det_gt",
+                "missed_gt_det",
                 "matched_det_seed_score",
                 "unmatched_det_seed_score",
             ):

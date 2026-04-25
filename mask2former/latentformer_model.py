@@ -397,6 +397,19 @@ class LatentFormer(nn.Module):
                 spatial_valid_mask,
             )
 
+        if self.signature_on and targets is not None and "gt_signatures" in outputs:
+            query_signatures = LatentAggregator._flatten_layer_queries(
+                outputs["pred_signatures"],
+                "pred_signatures",
+            )
+            query_seed_scores = self._flatten_layer_logits(
+                outputs["pred_seed_logits"],
+                "pred_seed_logits",
+            ).sigmoid()
+        else:
+            query_signatures = None
+            query_seed_scores = None
+
         for idx, (input_per_image, image_size, output_size) in enumerate(
             zip(batched_inputs, image_sizes, output_sizes)
         ):
@@ -430,11 +443,22 @@ class LatentFormer(nn.Module):
                 gt_pad_mask = targets["pad_mask"][idx]
                 processed_results[idx]["latentformer_signature_eval"] = {
                     "gt_signatures": outputs["gt_signatures"][idx, gt_pad_mask].detach().cpu(),
-                    "det_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
-                    "det_seed_scores": seed_scores[idx, seed_pad_mask[idx]].detach().cpu(),
+                    "det_signatures": query_signatures[idx].detach().cpu(),
+                    "det_seed_scores": query_seed_scores[idx].detach().cpu(),
+                    "selected_seed_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
+                    "selected_seed_scores": seed_scores[idx, seed_pad_mask[idx]].detach().cpu(),
                 }
 
         return processed_results
+
+    @staticmethod
+    def _flatten_layer_logits(values: torch.Tensor, name: str) -> torch.Tensor:
+        if values.dim() == 2:
+            return values
+        if values.dim() == 3:
+            layers, batch, queries = values.shape
+            return values.permute(1, 0, 2).reshape(batch, layers * queries)
+        raise ValueError(f"{name} must be shaped [B,Q] or [L,B,Q], got {values.shape}.")
 
     def _prepare_batched_mask_predictions(self, mask_pred_results, batched_inputs, image_sizes):
         if not self.sem_seg_postprocess_before_inference:
