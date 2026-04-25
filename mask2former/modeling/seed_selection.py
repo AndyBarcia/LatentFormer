@@ -169,9 +169,9 @@ class GoldenSeedSelection(SeedSelectionBase):
         gt_signatures: torch.Tensor = None,
         gt_pad_mask: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        del query_seed_logits
         self._require_gt_signatures(gt_signatures, gt_pad_mask)
         q_sig_flat = self._flatten_query_features(query_signatures, "query_signatures")
+        q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
         gt_pad_mask = gt_pad_mask.to(device=gt_signatures.device)
 
         sim = pairwise_similarity(
@@ -185,7 +185,7 @@ class GoldenSeedSelection(SeedSelectionBase):
         seed_signatures = q_sig_flat.gather(1, gather_idx) * gt_pad_mask[:, :, None].to(
             dtype=q_sig_flat.dtype
         )
-        seed_scores = sim.max(dim=1).values.masked_fill(~gt_pad_mask, 0.0)
+        seed_scores = q_seed_logits_flat.sigmoid().gather(1, best_query).masked_fill(~gt_pad_mask, 0.0)
         return seed_signatures, gt_pad_mask, seed_scores
 
 

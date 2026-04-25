@@ -30,12 +30,15 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
                 continue
             gt_signatures = diagnostics["gt_signatures"].float()
             det_signatures = diagnostics["det_signatures"].float()
+            det_seed_scores = diagnostics.get("det_seed_scores")
+            if det_seed_scores is not None:
+                det_seed_scores = det_seed_scores.float()
             num_gt = int(gt_signatures.shape[0])
             bucket = f"gt_{num_gt:03d}"
-            self._add_image_stats("all", gt_signatures, det_signatures)
-            self._add_image_stats(bucket, gt_signatures, det_signatures)
+            self._add_image_stats("all", gt_signatures, det_signatures, det_seed_scores)
+            self._add_image_stats(bucket, gt_signatures, det_signatures, det_seed_scores)
 
-    def _add_image_stats(self, bucket, gt_signatures, det_signatures):
+    def _add_image_stats(self, bucket, gt_signatures, det_signatures, det_seed_scores=None):
         if gt_signatures.shape[0] >= 2:
             gt_dist = pairwise_distance(
                 gt_signatures,
@@ -65,6 +68,9 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
             self._stats[bucket]["matched_det_gt"].extend(
                 cost[row_ind, col_ind].astype(float).tolist()
             )
+            if det_seed_scores is not None:
+                matched_scores = det_seed_scores[row_ind]
+                self._stats[bucket]["matched_det_seed_score"].extend(matched_scores.tolist())
 
         unmatched_det = [
             det_idx for det_idx in range(det_signatures.shape[0]) if det_idx not in matched_det
@@ -72,6 +78,10 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
         if unmatched_det:
             nearest_unmatched = det_gt_dist[unmatched_det].min(dim=1).values
             self._stats[bucket]["unmatched_det_gt"].extend(nearest_unmatched.tolist())
+            if det_seed_scores is not None:
+                self._stats[bucket]["unmatched_det_seed_score"].extend(
+                    det_seed_scores[unmatched_det].tolist()
+                )
 
     def evaluate(self):
         local_stats = {
@@ -90,16 +100,28 @@ class LatentFormerSignatureEvaluator(DatasetEvaluator):
 
         results = OrderedDict()
         for bucket in sorted(merged.keys()):
-            for metric_name in ("gt_gt", "matched_det_gt", "unmatched_det_gt"):
+            for metric_name in (
+                "gt_gt",
+                "matched_det_gt",
+                "unmatched_det_gt",
+                "matched_det_seed_score",
+                "unmatched_det_seed_score",
+            ):
                 values = torch.tensor(merged[bucket].get(metric_name, []), dtype=torch.float32)
                 prefix = f"{bucket}/{metric_name}"
                 results[f"{prefix}_count"] = int(values.numel())
                 if values.numel() == 0:
                     results[f"{prefix}_avg"] = float("nan")
                     results[f"{prefix}_dev"] = float("nan")
+                    results[f"{prefix}_min"] = float("nan")
+                    results[f"{prefix}_p50"] = float("nan")
+                    results[f"{prefix}_max"] = float("nan")
                 else:
                     results[f"{prefix}_avg"] = float(values.mean().item())
                     results[f"{prefix}_dev"] = float(values.std(unbiased=False).item())
+                    results[f"{prefix}_min"] = float(values.min().item())
+                    results[f"{prefix}_p50"] = float(values.quantile(0.5).item())
+                    results[f"{prefix}_max"] = float(values.max().item())
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)

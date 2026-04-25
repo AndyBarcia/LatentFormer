@@ -314,7 +314,7 @@ class LatentFormer(nn.Module):
         for mode, seed_selection in self.seed_selection_modules.items():
             gt_signatures = outputs.get("gt_signatures")
             gt_pad_mask = targets["pad_mask"] if targets is not None else None
-            seed_signatures, seed_pad_mask, _ = seed_selection(
+            seed_signatures, seed_pad_mask, seed_scores = seed_selection(
                 outputs["pred_signatures"],
                 outputs["pred_seed_logits"],
                 gt_signatures=gt_signatures,
@@ -327,6 +327,7 @@ class LatentFormer(nn.Module):
                 padded_image_size,
                 seed_signatures,
                 seed_pad_mask,
+                seed_scores,
                 targets=targets,
             )
 
@@ -342,6 +343,7 @@ class LatentFormer(nn.Module):
         padded_image_size,
         seed_signatures,
         seed_pad_mask,
+        seed_scores,
         targets=None,
     ):
         proto_cls, proto_masks, _ = self.aggregator(
@@ -431,6 +433,7 @@ class LatentFormer(nn.Module):
                 processed_results[idx]["latentformer_signature_eval"] = {
                     "gt_signatures": outputs["gt_signatures"][idx, object_gt_mask].detach().cpu(),
                     "det_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
+                    "det_seed_scores": seed_scores[idx, seed_pad_mask[idx]].detach().cpu(),
                 }
 
         return processed_results
