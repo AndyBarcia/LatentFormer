@@ -4,7 +4,7 @@ from typing import Dict, Iterable, Optional, Sequence, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 
 class GroundTruthEncoder(nn.Module):
@@ -61,7 +61,7 @@ class GroundTruthEncoder(nn.Module):
         # These reductions sum over full feature maps (for example 128x128). Under AMP,
         # the intermediate sums can overflow fp16 even when every input value is finite,
         # which then poisons GT signatures. Keep the pooling/projection path in fp32.
-        with autocast(enabled=False):
+        with autocast("cuda", enabled=False):
             feature_map_float = feature_map.float()
             masks_float = masks.float()
             valid = pad_mask[:, :, None, None].to(dtype=feature_map_float.dtype)
