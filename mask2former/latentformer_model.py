@@ -170,6 +170,7 @@ class LatentFormer(nn.Module):
         gt_sep_weight = cfg.MODEL.LATENT_FORMER.GT_SEP_WEIGHT
         seed_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT
         seed_sig_weight = cfg.MODEL.LATENT_FORMER.SEED_SIG_WEIGHT
+        seed_weight_pattern_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT_PATTERN_WEIGHT
         weight_dict = {
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
@@ -177,6 +178,7 @@ class LatentFormer(nn.Module):
             "loss_gt_sep": gt_sep_weight,
             "loss_seed": seed_weight,
             "loss_seed_sig": seed_sig_weight,
+            "loss_seed_weight": seed_weight_pattern_weight,
         }
         criterion = LatentCriterion(
             sem_seg_head.num_classes,
@@ -187,6 +189,7 @@ class LatentFormer(nn.Module):
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
+            aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
         )
         gt_encoder = GroundTruthEncoder(
             num_classes=cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES,

@@ -67,6 +67,7 @@ class LatentCriterion(nn.Module):
         oversample_ratio,
         importance_sample_ratio,
         similarity_metric,
+        aggregation_similarity_metric,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -78,6 +79,7 @@ class LatentCriterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
         self.similarity_metric = similarity_metric
+        self.aggregation_similarity_metric = aggregation_similarity_metric
 
     @staticmethod
     def _get_global_normalizer(counts):
@@ -114,6 +116,10 @@ class LatentCriterion(nn.Module):
             layers, batch, queries = values.shape
             return values.permute(1, 0, 2).reshape(batch, layers * queries)
         raise ValueError(f"{name} must be shaped [B,Q] or [L,B,Q], got {values.shape}.")
+
+    @staticmethod
+    def _normalize_assignment_weights(weights, dim, eps=1e-6):
+        return weights / weights.sum(dim=dim, keepdim=True).clamp_min(eps)
 
     def _resize_target_masks(self, masks, size):
         return F.interpolate(masks.float(), size=size, mode="area")
@@ -235,6 +241,7 @@ class LatentCriterion(nn.Module):
         loss_seed = F.binary_cross_entropy_with_logits(q_seed_logits_flat, seed_targets)
 
         loss_seed_sig = q_sig_flat.sum() * 0.0
+        loss_seed_weight = q_sig_flat.sum() * 0.0
         matched_pos = matched_query_mask.nonzero(as_tuple=False)
         if matched_pos.numel() > 0:
             matched_gt = matched_gt_indices[matched_query_mask]
@@ -247,9 +254,34 @@ class LatentCriterion(nn.Module):
             ).squeeze(-1).squeeze(-1)
             loss_seed_sig = (1.0 - matched_similarity).sum() / num_signatures
 
+            num_queries = q_sig_flat.shape[1]
+            query_to_query_pattern = pairwise_similarity(
+                q_sig_flat,
+                q_sig_flat,
+                metric=self.aggregation_similarity_metric,
+            ).clamp_min(0.0)
+            query_to_gt_pattern = pairwise_similarity(
+                q_sig_flat,
+                gt_signatures.detach(),
+                metric=self.aggregation_similarity_metric,
+            ).clamp_min(0.0)
+
+            safe_matched_gt_indices = matched_gt_indices.clamp_min(0)
+            query_pattern = query_to_query_pattern
+            gt_pattern = query_to_gt_pattern.gather(
+                dim=2,
+                index=safe_matched_gt_indices[:, None, :].expand(-1, num_queries, -1),
+            ).detach()
+
+            query_pattern = self._normalize_assignment_weights(query_pattern, dim=1)
+            gt_pattern = self._normalize_assignment_weights(gt_pattern, dim=1)
+            pattern_loss = (query_pattern - gt_pattern).abs().sum(dim=1)
+            loss_seed_weight = pattern_loss[matched_query_mask].sum() / num_signatures
+
         return {
             "loss_seed": loss_seed,
             "loss_seed_sig": loss_seed_sig,
+            "loss_seed_weight": loss_seed_weight,
         }
 
     def get_loss(self, loss, outputs, targets, num_signatures):
@@ -281,6 +313,7 @@ class LatentCriterion(nn.Module):
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),
             "similarity_metric: {}".format(self.similarity_metric),
+            "aggregation_similarity_metric: {}".format(self.aggregation_similarity_metric),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]
