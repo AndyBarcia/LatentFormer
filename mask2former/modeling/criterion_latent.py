@@ -229,7 +229,6 @@ class LatentCriterion(nn.Module):
             q_sig_flat,
             gt_signatures,
             pad_mask,
-            q_seed_logits_flat=q_seed_logits_flat,
         )
 
         seed_targets = matched_query_mask.to(dtype=q_seed_logits_flat.dtype)

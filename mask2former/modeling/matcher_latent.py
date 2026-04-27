@@ -9,10 +9,9 @@ from .similarity import pairwise_similarity
 class LatentMatcher(nn.Module):
     """Hungarian matcher for LatentFormer seed/signature assignments."""
 
-    def __init__(self, similarity_metric: str = "dot", seed_cost_weight: float = 1.0):
+    def __init__(self, similarity_metric: str = "dot"):
         super().__init__()
         self.similarity_metric = similarity_metric
-        self.seed_cost_weight = seed_cost_weight
 
     @torch.no_grad()
     def forward(
@@ -20,7 +19,6 @@ class LatentMatcher(nn.Module):
         q_sig_flat,
         gt_sigs_norm,
         gt_pad_mask,
-        q_seed_logits_flat=None,
     ):
         B, num_queries, _ = q_sig_flat.shape
         matched_query_mask = torch.zeros((B, num_queries), dtype=torch.bool, device=q_sig_flat.device)
@@ -37,9 +35,6 @@ class LatentMatcher(nn.Module):
                 metric=self.similarity_metric,
             )
             cost = 1.0 - sim
-            if q_seed_logits_flat is not None and self.seed_cost_weight != 0.0:
-                seed_cost = 1.0 - torch.sigmoid(q_seed_logits_flat[b])
-                cost = cost + self.seed_cost_weight * seed_cost.unsqueeze(-1)
             cost = cost.detach().cpu().numpy()
             row_ind, col_ind = linear_sum_assignment(cost)
             if len(row_ind) == 0:
@@ -58,7 +53,6 @@ class LatentMatcher(nn.Module):
         head = "Matcher " + self.__class__.__name__
         body = [
             "similarity_metric: {}".format(self.similarity_metric),
-            "seed_cost_weight: {}".format(self.seed_cost_weight),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)
