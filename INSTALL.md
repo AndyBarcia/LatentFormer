@@ -19,6 +19,16 @@ cd mask2former/modeling/pixel_decoder/ops
 sh make.sh
 ```
 
+### C++ extension for LatentFormer seed selection
+LatentFormer can use a native C++ implementation of `ClusteringSeedSelection` for the common
+`dot`, `dot-sigmoid`, `cosine`, `centered-cosine`, and `softmax` similarity metrics. If the
+extension is not built, the model automatically falls back to the Python implementation.
+
+```bash
+cd mask2former/modeling/seed_selection_ops
+sh make.sh
+```
+
 #### Building on another system
 To build on a system that does not have a GPU device but provide the drivers:
 ```bash

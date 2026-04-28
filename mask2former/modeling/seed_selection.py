@@ -2,6 +2,7 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
+from .seed_selection_ops.functions import clustering_seed_selection_native
 from .similarity import pairwise_similarity
 
 
@@ -36,6 +37,14 @@ class SeedSelectionBase(nn.Module):
 
 class ClusteringSeedSelection(SeedSelectionBase):
     """Select seed queries and merge duplicate detections with connected components."""
+
+    _NATIVE_SUPPORTED_METRICS = {
+        "centered-cosine",
+        "cosine",
+        "dot",
+        "dot-sigmoid",
+        "softmax",
+    }
 
     def __init__(
         self,
@@ -86,6 +95,18 @@ class ClusteringSeedSelection(SeedSelectionBase):
         del gt_signatures, gt_pad_mask
         q_sig_flat = self._flatten_query_features(query_signatures, "query_signatures")
         q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
+
+        if self.similarity_metric.lower() in self._NATIVE_SUPPORTED_METRICS:
+            native_result = clustering_seed_selection_native(
+                q_sig_flat,
+                q_seed_logits_flat,
+                seed_threshold=self.seed_threshold,
+                duplicate_threshold=self.duplicate_threshold,
+                similarity_metric=self.similarity_metric,
+            )
+            if native_result is not None:
+                return native_result
+
         q_seed_scores = q_seed_logits_flat.sigmoid()
 
         selected_mask = q_seed_scores >= self.seed_threshold
