@@ -62,3 +62,55 @@ def clustering_seed_selection_native(
         float(eps),
         float(temp),
     )
+
+
+def seed_cluster_precision_recall_native(
+    query_signatures,
+    query_seed_logits,
+    matched_query_mask,
+    matched_gt_indices,
+    *,
+    seed_thresholds,
+    duplicate_thresholds,
+    similarity_metric,
+    eps=1e-6,
+    temp=0.1,
+):
+    native_op = _load_native_op()
+    if native_op is None or not hasattr(native_op, "seed_cluster_precision_recall_forward"):
+        global _WARNED
+        if not _WARNED:
+            warnings.warn(
+                "LatentFormerSeedSelection extension is not built or is out of date; "
+                "falling back to the Python seed cluster metric implementation. Build it with "
+                "`cd mask2former/modeling/seed_selection_ops && sh make.sh`.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _WARNED = True
+        return None
+
+    values = native_op.seed_cluster_precision_recall_forward(
+        query_signatures,
+        query_seed_logits,
+        matched_query_mask,
+        matched_gt_indices,
+        seed_thresholds,
+        duplicate_thresholds,
+        similarity_metric.lower(),
+        float(eps),
+        float(temp),
+    )
+    keys = (
+        "tp",
+        "fp",
+        "fn",
+        "precision",
+        "recall",
+        "total_tp",
+        "total_fp",
+        "total_fn",
+        "micro_precision",
+        "micro_recall",
+    )
+    return dict(zip(keys, values))

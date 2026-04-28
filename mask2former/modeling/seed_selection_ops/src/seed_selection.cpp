@@ -1,8 +1,11 @@
 #include <torch/extension.h>
 
+#include <algorithm>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -38,6 +41,94 @@ torch::Tensor compute_similarity(
   }
   return similarity.clamp(0.0, 1.0);
 }
+
+class DsuCounter {
+ public:
+  DsuCounter(const std::vector<uint8_t>& active, const std::vector<uint8_t>& matched)
+      : parent_(active.size()),
+        rank_(active.size(), 0),
+        active_(active),
+        has_match_(matched),
+        tp_(0),
+        fp_(0) {
+    std::iota(parent_.begin(), parent_.end(), 0);
+    for (size_t idx = 0; idx < active_.size(); ++idx) {
+      if (!active_[idx]) {
+        continue;
+      }
+      if (has_match_[idx]) {
+        ++tp_;
+      } else {
+        ++fp_;
+      }
+    }
+  }
+
+  int64_t find(int64_t value) {
+    if (parent_[value] != value) {
+      parent_[value] = find(parent_[value]);
+    }
+    return parent_[value];
+  }
+
+  void unite(int64_t lhs, int64_t rhs) {
+    if (!active_[lhs] || !active_[rhs]) {
+      return;
+    }
+
+    int64_t lhs_root = find(lhs);
+    int64_t rhs_root = find(rhs);
+    if (lhs_root == rhs_root) {
+      return;
+    }
+
+    remove_component(lhs_root);
+    remove_component(rhs_root);
+
+    if (rank_[lhs_root] < rank_[rhs_root]) {
+      std::swap(lhs_root, rhs_root);
+    }
+    parent_[rhs_root] = lhs_root;
+    if (rank_[lhs_root] == rank_[rhs_root]) {
+      ++rank_[lhs_root];
+    }
+    active_[lhs_root] = 1;
+    has_match_[lhs_root] = has_match_[lhs_root] || has_match_[rhs_root];
+    add_component(lhs_root);
+  }
+
+  int64_t tp() const {
+    return tp_;
+  }
+
+  int64_t fp() const {
+    return fp_;
+  }
+
+ private:
+  void remove_component(int64_t root) {
+    if (has_match_[root]) {
+      --tp_;
+    } else {
+      --fp_;
+    }
+  }
+
+  void add_component(int64_t root) {
+    if (has_match_[root]) {
+      ++tp_;
+    } else {
+      ++fp_;
+    }
+  }
+
+  std::vector<int64_t> parent_;
+  std::vector<uint8_t> rank_;
+  std::vector<uint8_t> active_;
+  std::vector<uint8_t> has_match_;
+  int64_t tp_;
+  int64_t fp_;
+};
 
 }  // namespace
 
@@ -151,9 +242,164 @@ std::vector<torch::Tensor> clustering_seed_selection_forward(
   return {seed_signatures, pad_mask, out_scores};
 }
 
+std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
+    const torch::Tensor& query_signatures,
+    const torch::Tensor& query_seed_logits,
+    const torch::Tensor& matched_query_mask,
+    const torch::Tensor& matched_gt_indices,
+    const torch::Tensor& seed_thresholds,
+    const torch::Tensor& duplicate_thresholds,
+    const std::string& metric,
+    double eps,
+    double temp) {
+  TORCH_CHECK(query_signatures.dim() == 3, "query_signatures must be shaped [B,Q,C]");
+  TORCH_CHECK(query_seed_logits.dim() == 2, "query_seed_logits must be shaped [B,Q]");
+  TORCH_CHECK(matched_query_mask.dim() == 2, "matched_query_mask must be shaped [B,Q]");
+  TORCH_CHECK(matched_gt_indices.dim() == 2, "matched_gt_indices must be shaped [B,Q]");
+  TORCH_CHECK(seed_thresholds.dim() == 1, "seed_thresholds must be a 1D tensor");
+  TORCH_CHECK(duplicate_thresholds.dim() == 1, "duplicate_thresholds must be a 1D tensor");
+  TORCH_CHECK(
+      query_signatures.size(0) == query_seed_logits.size(0) &&
+          query_signatures.size(1) == query_seed_logits.size(1),
+      "query_signatures and query_seed_logits must agree on [B,Q]");
+  TORCH_CHECK(
+      matched_query_mask.sizes() == query_seed_logits.sizes(),
+      "matched_query_mask must match query_seed_logits shape");
+  TORCH_CHECK(
+      matched_gt_indices.sizes() == query_seed_logits.sizes(),
+      "matched_gt_indices must match query_seed_logits shape");
+
+  const auto batch_size = query_signatures.size(0);
+  const auto num_queries = query_signatures.size(1);
+  const auto num_seed_thresholds = seed_thresholds.size(0);
+  const auto num_duplicate_thresholds = duplicate_thresholds.size(0);
+  const auto device = query_signatures.device();
+
+  auto seed_scores_cpu = query_seed_logits.to(torch::kFloat).sigmoid().to(torch::kCPU).contiguous();
+  auto matched_cpu = matched_query_mask.to(torch::kBool).to(torch::kCPU).contiguous();
+  auto matched_gt_cpu = matched_gt_indices.to(torch::kLong).to(torch::kCPU).contiguous();
+  auto seed_thresholds_cpu = seed_thresholds.to(torch::kFloat).to(torch::kCPU).contiguous();
+  auto duplicate_thresholds_cpu = duplicate_thresholds.to(torch::kFloat).to(torch::kCPU).contiguous();
+  auto similarity_cpu = compute_similarity(query_signatures, metric, eps, temp)
+                            .to(torch::kFloat)
+                            .to(torch::kCPU)
+                            .contiguous();
+
+  auto scores_a = seed_scores_cpu.accessor<float, 2>();
+  auto matched_a = matched_cpu.accessor<bool, 2>();
+  auto matched_gt_a = matched_gt_cpu.accessor<int64_t, 2>();
+  auto seed_thresholds_a = seed_thresholds_cpu.accessor<float, 1>();
+  auto duplicate_thresholds_a = duplicate_thresholds_cpu.accessor<float, 1>();
+  auto similarity_a = similarity_cpu.accessor<float, 3>();
+
+  auto cpu_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCPU);
+  auto tp_cpu = torch::zeros(
+      {batch_size, num_seed_thresholds, num_duplicate_thresholds}, cpu_options);
+  auto fp_cpu = torch::zeros_like(tp_cpu);
+  auto fn_cpu = torch::zeros_like(tp_cpu);
+  auto tp_a = tp_cpu.accessor<float, 3>();
+  auto fp_a = fp_cpu.accessor<float, 3>();
+  auto fn_a = fn_cpu.accessor<float, 3>();
+
+  std::vector<int64_t> total_matched(batch_size, 0);
+  for (int64_t b = 0; b < batch_size; ++b) {
+    for (int64_t q = 0; q < num_queries; ++q) {
+      if (matched_a[b][q]) {
+        TORCH_CHECK(
+            matched_gt_a[b][q] >= 0,
+            "matched_gt_indices must be non-negative where matched_query_mask is true");
+        total_matched[b] += 1;
+      }
+    }
+  }
+
+  std::vector<int64_t> seed_order(num_seed_thresholds);
+  std::iota(seed_order.begin(), seed_order.end(), 0);
+  std::sort(seed_order.begin(), seed_order.end(), [&](int64_t lhs, int64_t rhs) {
+    return seed_thresholds_a[lhs] > seed_thresholds_a[rhs];
+  });
+
+  std::vector<int64_t> duplicate_order(num_duplicate_thresholds);
+  std::iota(duplicate_order.begin(), duplicate_order.end(), 0);
+  std::sort(duplicate_order.begin(), duplicate_order.end(), [&](int64_t lhs, int64_t rhs) {
+    return duplicate_thresholds_a[lhs] > duplicate_thresholds_a[rhs];
+  });
+
+  for (int64_t b = 0; b < batch_size; ++b) {
+    std::vector<std::tuple<float, int64_t, int64_t>> edges;
+    edges.reserve(num_queries * (num_queries - 1) / 2);
+    for (int64_t lhs = 0; lhs < num_queries; ++lhs) {
+      for (int64_t rhs = lhs + 1; rhs < num_queries; ++rhs) {
+        edges.emplace_back(similarity_a[b][lhs][rhs], lhs, rhs);
+      }
+    }
+    std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+      return std::get<0>(lhs) > std::get<0>(rhs);
+    });
+
+    std::vector<uint8_t> matched(num_queries, 0);
+    for (int64_t q = 0; q < num_queries; ++q) {
+      matched[q] = matched_a[b][q] ? 1 : 0;
+    }
+
+    for (const int64_t seed_idx : seed_order) {
+      const float seed_threshold = seed_thresholds_a[seed_idx];
+      std::vector<uint8_t> active(num_queries, 0);
+      for (int64_t q = 0; q < num_queries; ++q) {
+        active[q] = scores_a[b][q] >= seed_threshold ? 1 : 0;
+      }
+
+      DsuCounter dsu(active, matched);
+      size_t edge_cursor = 0;
+      for (const int64_t duplicate_idx : duplicate_order) {
+        const float duplicate_threshold = duplicate_thresholds_a[duplicate_idx];
+        while (edge_cursor < edges.size() &&
+               std::get<0>(edges[edge_cursor]) >= duplicate_threshold) {
+          dsu.unite(std::get<1>(edges[edge_cursor]), std::get<2>(edges[edge_cursor]));
+          ++edge_cursor;
+        }
+
+        const int64_t image_tp = dsu.tp();
+        const int64_t image_fp = dsu.fp();
+        tp_a[b][seed_idx][duplicate_idx] = static_cast<float>(image_tp);
+        fp_a[b][seed_idx][duplicate_idx] = static_cast<float>(image_fp);
+        fn_a[b][seed_idx][duplicate_idx] = static_cast<float>(total_matched[b] - image_tp);
+      }
+    }
+  }
+
+  auto tp = tp_cpu.to(device);
+  auto fp = fp_cpu.to(device);
+  auto fn = fn_cpu.to(device);
+  auto precision = tp / (tp + fp).clamp_min(1.0);
+  auto recall = tp / (tp + fn).clamp_min(1.0);
+  auto total_tp = tp.sum(0);
+  auto total_fp = fp.sum(0);
+  auto total_fn = fn.sum(0);
+  auto micro_precision = total_tp / (total_tp + total_fp).clamp_min(1.0);
+  auto micro_recall = total_tp / (total_tp + total_fn).clamp_min(1.0);
+
+  return {
+      tp,
+      fp,
+      fn,
+      precision,
+      recall,
+      total_tp,
+      total_fp,
+      total_fn,
+      micro_precision,
+      micro_recall,
+  };
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "clustering_seed_selection_forward",
       &clustering_seed_selection_forward,
       "LatentFormer clustering seed selection forward");
+  m.def(
+      "seed_cluster_precision_recall_forward",
+      &seed_cluster_precision_recall_forward,
+      "LatentFormer seed cluster precision/recall forward");
 }
