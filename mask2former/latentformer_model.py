@@ -63,11 +63,21 @@ class LatentAggregator(nn.Module):
             return values.permute(1, 0, 2, 3).reshape(batch, layers * queries, values.shape[-1])
         raise ValueError(f"{name} must be shaped [B,Q,C] or [L,B,Q,C], got {values.shape}.")
 
+    @staticmethod
+    def _flatten_layer_logits(values: torch.Tensor, name: str) -> torch.Tensor:
+        if values.dim() == 2:
+            return values
+        if values.dim() == 3:
+            layers, batch, queries = values.shape
+            return values.permute(1, 0, 2).reshape(batch, layers * queries)
+        raise ValueError(f"{name} must be shaped [B,Q] or [L,B,Q], got {values.shape}.")
+
     def forward(
         self,
         query_class_logits: torch.Tensor,
         query_mask_embeddings: torch.Tensor,
         query_signatures: torch.Tensor,
+        query_seed_logits: torch.Tensor,
         seed_signatures: torch.Tensor,
         *,
         mask_features,
@@ -76,6 +86,8 @@ class LatentAggregator(nn.Module):
         q_cls_flat = self._flatten_layer_queries(query_class_logits, "query_class_logits")
         q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
         q_sig_flat = self._flatten_layer_queries(query_signatures, "query_signatures")
+        q_seed_logits_flat = self._flatten_layer_logits(query_seed_logits, "query_seed_logits")
+        non_seed_gate = 1.0 - q_seed_logits_flat.float().sigmoid()
 
         sim = pairwise_similarity(
             q_sig_flat,
@@ -86,6 +98,7 @@ class LatentAggregator(nn.Module):
             similarity=sim,
             valid_mask=target_pad_mask,
         )
+        weights_flat = weights_flat * non_seed_gate.to(dtype=weights_flat.dtype).unsqueeze(-1)
         norm_w = normalize_assignment_weights(weights_flat)
 
         proto_mask_emb = aggregate_with_weights(norm_w, q_mask_emb_flat)
@@ -259,6 +272,7 @@ class LatentFormer(nn.Module):
                 outputs["pred_logits"],
                 outputs["pred_masks"],
                 outputs["pred_signatures"],
+                outputs["pred_seed_logits"],
                 outputs["gt_signatures"],
                 mask_features=outputs["mask_features"],
                 target_pad_mask=targets["pad_mask"],
@@ -350,6 +364,7 @@ class LatentFormer(nn.Module):
             outputs["pred_logits"],
             outputs["pred_masks"],
             outputs["pred_signatures"],
+            outputs["pred_seed_logits"],
             seed_signatures,
             mask_features=outputs["mask_features"],
             target_pad_mask=seed_pad_mask,
