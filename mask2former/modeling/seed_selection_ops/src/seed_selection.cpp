@@ -132,6 +132,15 @@ class DsuCounter {
 
 }  // namespace
 
+#ifdef WITH_CUDA
+std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
+    const torch::Tensor& query_signatures,
+    const torch::Tensor& seed_scores,
+    const torch::Tensor& selected_mask,
+    const torch::Tensor& similarity,
+    double duplicate_threshold);
+#endif
+
 std::vector<torch::Tensor> clustering_seed_selection_forward(
     const torch::Tensor& query_signatures,
     const torch::Tensor& query_seed_logits,
@@ -171,6 +180,18 @@ std::vector<torch::Tensor> clustering_seed_selection_forward(
   }
 
   auto similarity = compute_similarity(query_signatures, metric, eps, temp);
+#ifdef WITH_CUDA
+  if (query_signatures.is_cuda() && query_signatures.scalar_type() == torch::kFloat &&
+      similarity.scalar_type() == torch::kFloat) {
+    return clustering_seed_selection_cuda_forward(
+        query_signatures.contiguous(),
+        seed_scores.contiguous(),
+        selected_mask.contiguous(),
+        similarity.contiguous(),
+        duplicate_threshold);
+  }
+#endif
+
   auto adjacency = similarity >= duplicate_threshold;
   adjacency = adjacency.logical_and(selected_mask.unsqueeze(2)).logical_and(selected_mask.unsqueeze(1));
 
