@@ -184,6 +184,7 @@ class LatentFormer(nn.Module):
         seed_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT
         seed_sig_weight = cfg.MODEL.LATENT_FORMER.SEED_SIG_WEIGHT
         seed_weight_pattern_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT_PATTERN_WEIGHT
+        seed_cluster_pr_weight = cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR_WEIGHT
         weight_dict = {
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
@@ -192,7 +193,27 @@ class LatentFormer(nn.Module):
             "loss_seed": seed_weight,
             "loss_seed_sig": seed_sig_weight,
             "loss_seed_weight": seed_weight_pattern_weight,
+            "loss_seed_cluster_pr": seed_cluster_pr_weight,
         }
+        eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
+        seed_selection_modules = build_seed_selection_modules(
+            eval_modes=eval_modes,
+            similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
+            seed_cluster_pr_num_seed_thresholds=cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.NUM_SEED_THRESHOLDS,
+            seed_cluster_pr_num_duplicate_thresholds=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.NUM_DUPLICATE_THRESHOLDS
+            ),
+            seed_cluster_pr_seed_threshold_range=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.SEED_THRESHOLD_RANGE
+            ),
+            seed_cluster_pr_duplicate_threshold_range=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.DUPLICATE_THRESHOLD_RANGE
+            ),
+            seed_cluster_pr_hidden_dim=cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.HIDDEN_DIM,
+            seed_cluster_pr_inference_num_points=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.INFERENCE_NUM_POINTS
+            ),
+        )
         criterion = LatentCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
@@ -212,14 +233,6 @@ class LatentFormer(nn.Module):
         aggregator = LatentAggregator(
             aggregation_similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
         )
-        eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
-        seed_selection_modules = build_seed_selection_modules(
-            eval_modes=eval_modes,
-            seed_threshold=cfg.MODEL.LATENT_FORMER.TEST.SEED_THRESHOLD,
-            duplicate_threshold=cfg.MODEL.LATENT_FORMER.TEST.DUPLICATE_THRESHOLD,
-            similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
-        )
-
         return {
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
@@ -281,6 +294,9 @@ class LatentFormer(nn.Module):
             outputs["proto_cls"] = proto_cls
             outputs["proto_masks"] = proto_masks
             outputs["proto_mask_emb"] = proto_mask_emb
+            outputs["clustering_seed_selection"] = self.seed_selection_modules[
+                "ClusteringSeedSelection"
+            ]
 
             losses = self.criterion(outputs, targets)
             for k in list(losses.keys()):

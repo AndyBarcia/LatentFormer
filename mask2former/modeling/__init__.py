@@ -9,6 +9,7 @@ from .seed_selection import (
     GoldenSeedSelection,
     SeedSelection,
     SeedSelectionBase,
+    ThresholdPrecisionRecallMLP,
 )
 from .seed_cluster_metrics import (
     SeedClusterPrecisionRecall,

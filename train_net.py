@@ -76,6 +76,130 @@ from mask2former import (
 )
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _pareto_frontier_indices(precision, recall):
+    order = torch.argsort(recall, descending=True)
+    best_precision = precision.new_tensor(-1.0)
+    pareto = []
+    for idx in order.tolist():
+        if precision[idx] > best_precision + 1e-7:
+            pareto.append(idx)
+            best_precision = precision[idx]
+    if not pareto:
+        return torch.empty(0, dtype=torch.long, device=precision.device)
+    pareto = torch.as_tensor(pareto, dtype=torch.long, device=precision.device)
+    return pareto[torch.argsort(recall[pareto])]
+
+
+def plot_latentformer_seed_cluster_pr_predictions(cfg, model, iteration=None):
+    if cfg.MODEL.META_ARCHITECTURE != "LatentFormer":
+        return None
+    if not cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.PLOT_ON_EVAL:
+        return None
+    if not comm.is_main_process():
+        return None
+
+    model = _unwrap_model(model)
+    seed_selection_modules = getattr(model, "seed_selection_modules", {})
+    clustering_seed_selection = (
+        seed_selection_modules["ClusteringSeedSelection"]
+        if "ClusteringSeedSelection" in seed_selection_modules
+        else None
+    )
+    predictor = getattr(clustering_seed_selection, "threshold_pr_mlp", None)
+    if predictor is None:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pr_cfg = cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR
+    num_points = int(pr_cfg.PLOT_NUM_POINTS)
+    seed_min, seed_max = pr_cfg.SEED_THRESHOLD_RANGE
+    duplicate_min, duplicate_max = pr_cfg.DUPLICATE_THRESHOLD_RANGE
+
+    device = next(predictor.parameters()).device
+    seed_thresholds = torch.linspace(float(seed_min), float(seed_max), num_points, device=device)
+    duplicate_thresholds = torch.linspace(
+        float(duplicate_min),
+        float(duplicate_max),
+        num_points,
+        device=device,
+    )
+    was_training = predictor.training
+    predictor.eval()
+    with torch.no_grad():
+        predictions = predictor(seed_thresholds, duplicate_thresholds).detach().cpu()
+    if was_training:
+        predictor.train()
+
+    precision = predictions[..., 0].reshape(-1)
+    recall = predictions[..., 1].reshape(-1)
+    seed_grid, _ = torch.meshgrid(
+        seed_thresholds.detach().cpu(),
+        duplicate_thresholds.detach().cpu(),
+        indexing="ij",
+    )
+    flat_seed = seed_grid.reshape(-1)
+    pareto = _pareto_frontier_indices(precision, recall)
+
+    plot_dir = os.path.join(cfg.OUTPUT_DIR, "seed_cluster_pr_plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    if iteration is None:
+        name = "threshold_pr_mlp_eval"
+    else:
+        name = f"threshold_pr_mlp_iter_{int(iteration):07d}"
+    output_path = os.path.join(plot_dir, f"{name}.jpg")
+    latest_path = os.path.join(plot_dir, "threshold_pr_mlp_latest.jpg")
+
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=160)
+    scatter = ax.scatter(
+        recall.numpy(),
+        precision.numpy(),
+        c=flat_seed.numpy(),
+        s=4,
+        alpha=0.22,
+        cmap="viridis",
+        linewidths=0,
+    )
+    if pareto.numel() > 0:
+        ax.plot(
+            recall[pareto].numpy(),
+            precision[pareto].numpy(),
+            color="#d62728",
+            linewidth=2.2,
+            label=f"Pareto frontier ({pareto.numel()} pts)",
+        )
+        ax.scatter(
+            recall[pareto].numpy(),
+            precision[pareto].numpy(),
+            color="#d62728",
+            s=10,
+            zorder=3,
+        )
+    ax.set_xlabel("Predicted recall")
+    ax.set_ylabel("Predicted precision")
+    ax.set_title("Threshold MLP precision-recall predictions")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, alpha=0.25)
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("Seed threshold")
+    if pareto.numel() > 0:
+        ax.legend(loc="lower left")
+    fig.tight_layout()
+    fig.savefig(output_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
+    fig.savefig(latest_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
+    plt.close(fig)
+    logging.getLogger(__name__).info("Wrote LatentFormer PR threshold plot to %s", output_path)
+    return output_path
+
+
 class LatentFormerMultiModeEvaluator(DatasetEvaluator):
     def __init__(self, evaluators_by_mode):
         self.evaluators_by_mode = evaluators_by_mode
@@ -189,6 +313,11 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
+    def test_and_save_results(self):
+        results = super().test_and_save_results()
+        plot_latentformer_seed_cluster_pr_predictions(self.cfg, self.model, iteration=self.iter)
+        return results
 
     @staticmethod
     def _model_test_cfg(cfg):
@@ -504,6 +633,7 @@ def main(args):
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
         res = Trainer.test(cfg, model)
+        plot_latentformer_seed_cluster_pr_predictions(cfg, model)
         if cfg.TEST.AUG.ENABLED:
             res.update(Trainer.test_with_TTA(cfg, model))
         if comm.is_main_process():

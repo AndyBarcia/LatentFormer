@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
+from .seed_cluster_metrics import compute_seed_cluster_precision_recall
 from .seed_selection_ops.functions import clustering_seed_selection_native
 from .similarity import pairwise_similarity
 
@@ -49,14 +51,102 @@ class ClusteringSeedSelection(SeedSelectionBase):
     def __init__(
         self,
         *,
-        seed_threshold: float,
-        duplicate_threshold: float,
         similarity_metric: str = "cosine",
+        seed_cluster_pr_num_seed_thresholds: int = 3,
+        seed_cluster_pr_num_duplicate_thresholds: int = 3,
+        seed_cluster_pr_seed_threshold_range=(0.0, 1.0),
+        seed_cluster_pr_duplicate_threshold_range=(0.0, 1.0),
+        seed_cluster_pr_hidden_dim: int = 32,
+        seed_cluster_pr_inference_num_points: int = 201,
     ):
         super().__init__()
-        self.seed_threshold = seed_threshold
-        self.duplicate_threshold = duplicate_threshold
         self.similarity_metric = similarity_metric
+        self.seed_cluster_pr_num_seed_thresholds = seed_cluster_pr_num_seed_thresholds
+        self.seed_cluster_pr_num_duplicate_thresholds = seed_cluster_pr_num_duplicate_thresholds
+        self.seed_cluster_pr_seed_threshold_range = seed_cluster_pr_seed_threshold_range
+        self.seed_cluster_pr_duplicate_threshold_range = seed_cluster_pr_duplicate_threshold_range
+        self.seed_cluster_pr_inference_num_points = seed_cluster_pr_inference_num_points
+        self.threshold_pr_mlp = ThresholdPrecisionRecallMLP(
+            hidden_dim=seed_cluster_pr_hidden_dim,
+        )
+
+    def _sample_seed_cluster_thresholds(self, device):
+        seed_min, seed_max = self.seed_cluster_pr_seed_threshold_range
+        duplicate_min, duplicate_max = self.seed_cluster_pr_duplicate_threshold_range
+        seed_thresholds = torch.empty(
+            self.seed_cluster_pr_num_seed_thresholds,
+            device=device,
+        ).uniform_(float(seed_min), float(seed_max))
+        duplicate_thresholds = torch.empty(
+            self.seed_cluster_pr_num_duplicate_thresholds,
+            device=device,
+        ).uniform_(float(duplicate_min), float(duplicate_max))
+        return seed_thresholds, duplicate_thresholds
+
+    def threshold_pr_loss(
+        self,
+        *,
+        query_signatures: torch.Tensor,
+        query_seed_logits: torch.Tensor,
+        matched_query_mask: torch.Tensor,
+        matched_gt_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        seed_thresholds, duplicate_thresholds = self._sample_seed_cluster_thresholds(
+            query_signatures.device
+        )
+        seed_cluster_metrics = compute_seed_cluster_precision_recall(
+            query_signatures=query_signatures,
+            query_seed_logits=query_seed_logits,
+            matched_query_mask=matched_query_mask,
+            matched_gt_indices=matched_gt_indices,
+            seed_threshold=seed_thresholds,
+            duplicate_threshold=duplicate_thresholds,
+            metric=self.similarity_metric,
+        )
+        seed_cluster_pr_pred = self.threshold_pr_mlp(
+            seed_cluster_metrics["seed_thresholds"],
+            seed_cluster_metrics["duplicate_thresholds"],
+        )
+        seed_cluster_pr_target = torch.stack(
+            (
+                seed_cluster_metrics["micro_precision"],
+                seed_cluster_metrics["micro_recall"],
+            ),
+            dim=-1,
+        ).to(device=seed_cluster_pr_pred.device, dtype=seed_cluster_pr_pred.dtype)
+        return F.mse_loss(seed_cluster_pr_pred, seed_cluster_pr_target.detach())
+
+    def best_thresholds(self) -> tuple[float, float]:
+        num_points = int(self.seed_cluster_pr_inference_num_points)
+        if num_points <= 0:
+            raise ValueError(
+                "seed_cluster_pr_inference_num_points must be positive when selecting "
+                "clustering seed thresholds."
+            )
+
+        seed_min, seed_max = self.seed_cluster_pr_seed_threshold_range
+        duplicate_min, duplicate_max = self.seed_cluster_pr_duplicate_threshold_range
+        device = next(self.threshold_pr_mlp.parameters()).device
+        seed_thresholds = torch.linspace(float(seed_min), float(seed_max), num_points, device=device)
+        duplicate_thresholds = torch.linspace(
+            float(duplicate_min),
+            float(duplicate_max),
+            num_points,
+            device=device,
+        )
+        with torch.no_grad():
+            pr = self.threshold_pr_mlp(seed_thresholds, duplicate_thresholds)
+            precision = pr[..., 0]
+            recall = pr[..., 1]
+            rq = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
+            best_idx = rq.reshape(-1).argmax()
+            duplicate_idx = best_idx % duplicate_thresholds.numel()
+            seed_idx = best_idx // duplicate_thresholds.numel()
+
+        return (
+            float(seed_thresholds[seed_idx].detach().cpu()),
+            float(duplicate_thresholds[duplicate_idx].detach().cpu()),
+        )
 
     @staticmethod
     def _connected_components(adjacency: torch.Tensor) -> list[list[int]]:
@@ -89,10 +179,16 @@ class ClusteringSeedSelection(SeedSelectionBase):
         self,
         query_signatures: torch.Tensor,
         query_seed_logits: torch.Tensor,
+        *,
         gt_signatures: torch.Tensor = None,
         gt_pad_mask: torch.Tensor = None,
+        seed_threshold: float = None,
+        duplicate_threshold: float = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del gt_signatures, gt_pad_mask
+        if seed_threshold is None or duplicate_threshold is None:
+            seed_threshold, duplicate_threshold = self.best_thresholds()
+
         q_sig_flat = self._flatten_query_features(query_signatures, "query_signatures")
         q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
 
@@ -100,8 +196,8 @@ class ClusteringSeedSelection(SeedSelectionBase):
             native_result = clustering_seed_selection_native(
                 q_sig_flat,
                 q_seed_logits_flat,
-                seed_threshold=self.seed_threshold,
-                duplicate_threshold=self.duplicate_threshold,
+                seed_threshold=seed_threshold,
+                duplicate_threshold=duplicate_threshold,
                 similarity_metric=self.similarity_metric,
             )
             if native_result is not None:
@@ -109,7 +205,7 @@ class ClusteringSeedSelection(SeedSelectionBase):
 
         q_seed_scores = q_seed_logits_flat.sigmoid()
 
-        selected_mask = q_seed_scores >= self.seed_threshold
+        selected_mask = q_seed_scores >= seed_threshold
         empty_selection = ~selected_mask.any(dim=1)
         if empty_selection.any():
             fallback_indices = q_seed_scores.argmax(dim=1)
@@ -121,7 +217,7 @@ class ClusteringSeedSelection(SeedSelectionBase):
             q_sig_flat,
             metric=self.similarity_metric,
         )
-        adjacency = similarity >= self.duplicate_threshold
+        adjacency = similarity >= duplicate_threshold
         adjacency = adjacency & selected_mask[:, :, None] & selected_mask[:, None, :]
         query_indices = torch.arange(q_sig_flat.shape[1], device=q_sig_flat.device)
         adjacency[:, query_indices, query_indices] = selected_mask
@@ -173,6 +269,39 @@ class ClusteringSeedSelection(SeedSelectionBase):
 
 
 SeedSelection = ClusteringSeedSelection
+
+
+class ThresholdPrecisionRecallMLP(nn.Module):
+    """Predict seed-cluster precision/recall from a threshold pair."""
+
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(
+        self,
+        seed_thresholds: torch.Tensor,
+        duplicate_thresholds: torch.Tensor,
+    ) -> torch.Tensor:
+        seed_thresholds = seed_thresholds.to(dtype=torch.float32)
+        duplicate_thresholds = duplicate_thresholds.to(
+            device=seed_thresholds.device,
+            dtype=torch.float32,
+        )
+        seed_grid, duplicate_grid = torch.meshgrid(
+            seed_thresholds,
+            duplicate_thresholds,
+            indexing="ij",
+        )
+        threshold_pairs = torch.stack((seed_grid, duplicate_grid), dim=-1)
+        return self.net(threshold_pairs)
 
 
 class GoldenSeedSelection(SeedSelectionBase):
@@ -245,17 +374,25 @@ class GTOracleSeedSelection(SeedSelectionBase):
 def build_seed_selection_modules(
     *,
     eval_modes,
-    seed_threshold: float,
-    duplicate_threshold: float,
     similarity_metric: str = "cosine",
+    seed_cluster_pr_num_seed_thresholds: int = 3,
+    seed_cluster_pr_num_duplicate_thresholds: int = 3,
+    seed_cluster_pr_seed_threshold_range=(0.0, 1.0),
+    seed_cluster_pr_duplicate_threshold_range=(0.0, 1.0),
+    seed_cluster_pr_hidden_dim: int = 32,
+    seed_cluster_pr_inference_num_points: int = 201,
 ):
     modules = nn.ModuleDict()
     for mode in eval_modes:
         if mode == "ClusteringSeedSelection":
             modules[mode] = ClusteringSeedSelection(
-                seed_threshold=seed_threshold,
-                duplicate_threshold=duplicate_threshold,
                 similarity_metric=similarity_metric,
+                seed_cluster_pr_num_seed_thresholds=seed_cluster_pr_num_seed_thresholds,
+                seed_cluster_pr_num_duplicate_thresholds=seed_cluster_pr_num_duplicate_thresholds,
+                seed_cluster_pr_seed_threshold_range=seed_cluster_pr_seed_threshold_range,
+                seed_cluster_pr_duplicate_threshold_range=seed_cluster_pr_duplicate_threshold_range,
+                seed_cluster_pr_hidden_dim=seed_cluster_pr_hidden_dim,
+                seed_cluster_pr_inference_num_points=seed_cluster_pr_inference_num_points,
             )
         elif mode == "GoldenSeedSelection":
             modules[mode] = GoldenSeedSelection(similarity_metric=similarity_metric)

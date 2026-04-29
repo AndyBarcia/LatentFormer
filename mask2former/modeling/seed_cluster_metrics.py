@@ -228,3 +228,4 @@ class SeedClusterPrecisionRecall(nn.Module):
             duplicate_threshold=self.duplicate_threshold,
             metric=self.metric,
         )
+

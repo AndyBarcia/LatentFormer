@@ -278,10 +278,19 @@ class LatentCriterion(nn.Module):
             pattern_loss = (query_pattern - gt_pattern).abs().sum(dim=1)
             loss_seed_weight = pattern_loss[matched_query_mask].sum() / num_signatures
 
+        clustering_seed_selection = outputs["clustering_seed_selection"]
+        loss_seed_cluster_pr = clustering_seed_selection.threshold_pr_loss(
+            query_signatures=q_sig_flat,
+            query_seed_logits=q_seed_logits_flat,
+            matched_query_mask=matched_query_mask,
+            matched_gt_indices=matched_gt_indices,
+        )
+
         return {
             "loss_seed": loss_seed,
             "loss_seed_sig": loss_seed_sig,
             "loss_seed_weight": loss_seed_weight,
+            "loss_seed_cluster_pr": loss_seed_cluster_pr,
         }
 
     def get_loss(self, loss, outputs, targets, num_signatures):
