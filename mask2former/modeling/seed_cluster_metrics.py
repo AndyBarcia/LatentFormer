@@ -195,36 +195,3 @@ def compute_seed_cluster_precision_recall(
         "seed_thresholds": seed_thresholds,
         "duplicate_thresholds": duplicate_thresholds,
     }
-
-
-class SeedClusterPrecisionRecall(nn.Module):
-    """Module wrapper for seed-cluster precision/recall sweeps."""
-
-    def __init__(
-        self,
-        *,
-        seed_threshold: float | Sequence[float] | torch.Tensor,
-        duplicate_threshold: float | Sequence[float] | torch.Tensor,
-        metric: str = "cosine",
-    ):
-        super().__init__()
-        self.seed_threshold = seed_threshold
-        self.duplicate_threshold = duplicate_threshold
-        self.metric = metric
-
-    def forward(
-        self,
-        query_signatures: torch.Tensor,
-        query_seed_logits: torch.Tensor,
-        matched_query_mask: torch.Tensor,
-        matched_gt_indices: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return compute_seed_cluster_precision_recall(
-            query_signatures=query_signatures,
-            query_seed_logits=query_seed_logits,
-            matched_query_mask=matched_query_mask,
-            matched_gt_indices=matched_gt_indices,
-            seed_threshold=self.seed_threshold,
-            duplicate_threshold=self.duplicate_threshold,
-            metric=self.metric,
-        )

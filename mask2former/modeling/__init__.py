@@ -11,10 +11,7 @@ from .seed_selection import (
     SeedSelectionBase,
     ThresholdPrecisionRecallMLP,
 )
-from .seed_cluster_metrics import (
-    SeedClusterPrecisionRecall,
-    compute_seed_cluster_precision_recall,
-)
+from .seed_cluster_metrics import compute_seed_cluster_precision_recall
 from .meta_arch.latent_former_head import LatentFormerHead
 from .meta_arch.mask_former_head import MaskFormerHead
 from .meta_arch.per_pixel_baseline import PerPixelBaselineHead, PerPixelBaselinePlusHead

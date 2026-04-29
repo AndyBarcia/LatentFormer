@@ -37,7 +37,7 @@ def clustering_seed_selection_native(
     duplicate_threshold,
     similarity_metric,
     eps=1e-6,
-    temp=0.1,
+    temp=1.0,
 ):
     native_op = _load_native_op()
     if native_op is None:
@@ -74,7 +74,7 @@ def seed_cluster_precision_recall_native(
     duplicate_thresholds,
     similarity_metric,
     eps=1e-6,
-    temp=0.1,
+    temp=1.0,
 ):
     native_op = _load_native_op()
     if native_op is None or not hasattr(native_op, "seed_cluster_precision_recall_forward"):

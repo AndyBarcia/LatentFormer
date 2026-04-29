@@ -188,16 +188,16 @@ std::vector<torch::Tensor> clustering_seed_selection_forward(
 
   auto similarity = compute_similarity(query_signatures, metric, eps, temp);
 #ifdef WITH_CUDA
-  if (query_signatures.is_cuda() && query_signatures.scalar_type() == torch::kFloat &&
-      similarity.scalar_type() == torch::kFloat) {
-    return clustering_seed_selection_cuda_forward(
-        query_signatures.contiguous(),
-        seed_scores.contiguous(),
-        selected_mask.contiguous(),
-        similarity.contiguous(),
-        duplicate_threshold);
-  }
+  return clustering_seed_selection_cuda_forward(
+      query_signatures.to(torch::kFloat).contiguous(),
+      seed_scores.to(torch::kFloat).contiguous(),
+      selected_mask.contiguous(),
+      similarity.to(torch::kFloat).contiguous(),
+      duplicate_threshold);
 #endif
+  TORCH_WARN_ONCE(
+      "LatentFormerSeedSelection clustering_seed_selection_forward is using the CPU "
+      "fallback. The CUDA path requires the extension to be built with CUDA ");
 
   auto adjacency = similarity >= duplicate_threshold;
   adjacency = adjacency.logical_and(selected_mask.unsqueeze(2)).logical_and(selected_mask.unsqueeze(1));
@@ -304,19 +304,18 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
   const auto device = query_signatures.device();
 
 #ifdef WITH_CUDA
-  if (query_signatures.is_cuda() && query_signatures.scalar_type() == torch::kFloat) {
-    auto seed_scores = query_seed_logits.to(torch::kFloat).sigmoid();
-    auto similarity = compute_similarity(query_signatures, metric, eps, temp);
-    if (seed_scores.scalar_type() == torch::kFloat && similarity.scalar_type() == torch::kFloat) {
-      return seed_cluster_precision_recall_cuda_forward(
-          seed_scores.contiguous(),
-          matched_query_mask.to(torch::kBool).contiguous(),
-          seed_thresholds.to(torch::kFloat).contiguous(),
-          duplicate_thresholds.to(torch::kFloat).contiguous(),
-          similarity.contiguous());
-    }
-  }
+  auto seed_scores = query_seed_logits.to(torch::kFloat).sigmoid();
+  auto similarity = compute_similarity(query_signatures, metric, eps, temp).to(torch::kFloat);
+  return seed_cluster_precision_recall_cuda_forward(
+      seed_scores.contiguous(),
+      matched_query_mask.to(torch::kBool).contiguous(),
+      seed_thresholds.to(torch::kFloat).contiguous(),
+      duplicate_thresholds.to(torch::kFloat).contiguous(),
+      similarity.contiguous());
 #endif
+  TORCH_WARN_ONCE(
+      "LatentFormerSeedSelection seed_cluster_precision_recall_forward is using the "
+      "CPU fallback. The CUDA path requires the extension to be built with CUDA ");
 
   auto seed_scores_cpu = query_seed_logits.to(torch::kFloat).sigmoid().to(torch::kCPU).contiguous();
   auto matched_cpu = matched_query_mask.to(torch::kBool).to(torch::kCPU).contiguous();
