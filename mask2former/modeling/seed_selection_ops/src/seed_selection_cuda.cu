@@ -146,6 +146,186 @@ __global__ void gather_seed_outputs_kernel(
   }
 }
 
+__global__ void init_pr_labels_kernel(
+    const float* __restrict__ scores,
+    const float* __restrict__ seed_thresholds,
+    int* __restrict__ labels,
+    int num_combos,
+    int num_seed_thresholds,
+    int num_duplicate_thresholds,
+    int num_queries) {
+  long long total = static_cast<long long>(num_combos) * num_queries;
+  long long linear = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+
+  int q = linear % num_queries;
+  int combo = linear / num_queries;
+  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
+  int rem = combo - b * num_seed_thresholds * num_duplicate_thresholds;
+  int seed_idx = rem / num_duplicate_thresholds;
+  float score = scores[b * num_queries + q];
+  labels[linear] = score >= seed_thresholds[seed_idx] ? q : -1;
+}
+
+__global__ void propagate_pr_labels_kernel(
+    const float* __restrict__ similarity,
+    const float* __restrict__ duplicate_thresholds,
+    int* __restrict__ labels,
+    int* __restrict__ changed,
+    int num_combos,
+    int num_seed_thresholds,
+    int num_duplicate_thresholds,
+    int num_queries) {
+  int combo = blockIdx.y;
+  int q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (combo >= num_combos || q >= num_queries) {
+    return;
+  }
+
+  int label_offset = combo * num_queries;
+  int label_idx = label_offset + q;
+  int current_label = labels[label_idx];
+  if (current_label < 0) {
+    return;
+  }
+
+  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
+  int duplicate_idx = combo % num_duplicate_thresholds;
+  float duplicate_threshold = duplicate_thresholds[duplicate_idx];
+  const float* sim_row = similarity + (static_cast<long long>(b) * num_queries + q) * num_queries;
+
+  int best = current_label;
+  for (int neighbor = 0; neighbor < num_queries; ++neighbor) {
+    int neighbor_label = labels[label_offset + neighbor];
+    if (neighbor_label >= 0 && sim_row[neighbor] >= duplicate_threshold) {
+      best = min(best, neighbor_label);
+    }
+  }
+
+  if (best < current_label) {
+    labels[label_idx] = best;
+    atomicExch(changed, 1);
+  }
+}
+
+__global__ void mark_pr_components_kernel(
+    const int* __restrict__ labels,
+    const bool* __restrict__ matched,
+    int* __restrict__ component_active,
+    int* __restrict__ component_matched,
+    int num_combos,
+    int num_seed_thresholds,
+    int num_duplicate_thresholds,
+    int num_queries) {
+  long long total = static_cast<long long>(num_combos) * num_queries;
+  long long linear = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+  if (linear >= total) {
+    return;
+  }
+
+  int q = linear % num_queries;
+  int combo = linear / num_queries;
+  int root = labels[linear];
+  if (root < 0) {
+    return;
+  }
+
+  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
+  int component_idx = combo * num_queries + root;
+  atomicExch(component_active + component_idx, 1);
+  if (matched[b * num_queries + q]) {
+    atomicExch(component_matched + component_idx, 1);
+  }
+}
+
+__global__ void count_total_matched_kernel(
+    const bool* __restrict__ matched,
+    float* __restrict__ total_matched,
+    int batch_size,
+    int num_queries) {
+  int b = blockIdx.x;
+  if (b >= batch_size) {
+    return;
+  }
+
+  __shared__ int thread_counts[kThreads];
+  int count = 0;
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    if (matched[b * num_queries + q]) {
+      ++count;
+    }
+  }
+  thread_counts[threadIdx.x] = count;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      thread_counts[threadIdx.x] += thread_counts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    total_matched[b] = static_cast<float>(thread_counts[0]);
+  }
+}
+
+__global__ void reduce_pr_counts_kernel(
+    const int* __restrict__ component_active,
+    const int* __restrict__ component_matched,
+    const float* __restrict__ total_matched,
+    float* __restrict__ tp,
+    float* __restrict__ fp,
+    float* __restrict__ fn,
+    int num_combos,
+    int num_seed_thresholds,
+    int num_duplicate_thresholds,
+    int num_queries) {
+  int combo = blockIdx.x;
+  if (combo >= num_combos) {
+    return;
+  }
+
+  __shared__ int thread_tp[kThreads];
+  __shared__ int thread_fp[kThreads];
+  int local_tp = 0;
+  int local_fp = 0;
+  int component_offset = combo * num_queries;
+  for (int root = threadIdx.x; root < num_queries; root += blockDim.x) {
+    int idx = component_offset + root;
+    if (component_active[idx]) {
+      if (component_matched[idx]) {
+        ++local_tp;
+      } else {
+        ++local_fp;
+      }
+    }
+  }
+
+  thread_tp[threadIdx.x] = local_tp;
+  thread_fp[threadIdx.x] = local_fp;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      thread_tp[threadIdx.x] += thread_tp[threadIdx.x + stride];
+      thread_fp[threadIdx.x] += thread_fp[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
+    float image_tp = static_cast<float>(thread_tp[0]);
+    float image_fp = static_cast<float>(thread_fp[0]);
+    tp[combo] = image_tp;
+    fp[combo] = image_fp;
+    fn[combo] = total_matched[b] - image_tp;
+  }
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
@@ -236,4 +416,131 @@ std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {seed_signatures, pad_mask, out_scores};
+}
+
+std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
+    const torch::Tensor& seed_scores,
+    const torch::Tensor& matched_query_mask,
+    const torch::Tensor& seed_thresholds,
+    const torch::Tensor& duplicate_thresholds,
+    const torch::Tensor& similarity) {
+  TORCH_CHECK(seed_scores.is_cuda(), "seed_scores must be CUDA");
+  TORCH_CHECK(matched_query_mask.is_cuda(), "matched_query_mask must be CUDA");
+  TORCH_CHECK(seed_thresholds.is_cuda(), "seed_thresholds must be CUDA");
+  TORCH_CHECK(duplicate_thresholds.is_cuda(), "duplicate_thresholds must be CUDA");
+  TORCH_CHECK(similarity.is_cuda(), "similarity must be CUDA");
+  TORCH_CHECK(seed_scores.scalar_type() == torch::kFloat, "CUDA PR expects float seed scores");
+  TORCH_CHECK(matched_query_mask.scalar_type() == torch::kBool, "CUDA PR expects bool matched mask");
+  TORCH_CHECK(seed_thresholds.scalar_type() == torch::kFloat, "CUDA PR expects float seed thresholds");
+  TORCH_CHECK(duplicate_thresholds.scalar_type() == torch::kFloat, "CUDA PR expects float duplicate thresholds");
+  TORCH_CHECK(similarity.scalar_type() == torch::kFloat, "CUDA PR expects float similarity");
+
+  const c10::cuda::CUDAGuard device_guard(seed_scores.device());
+  const int batch_size = static_cast<int>(seed_scores.size(0));
+  const int num_queries = static_cast<int>(seed_scores.size(1));
+  const int num_seed_thresholds = static_cast<int>(seed_thresholds.size(0));
+  const int num_duplicate_thresholds = static_cast<int>(duplicate_thresholds.size(0));
+  const int num_combos = batch_size * num_seed_thresholds * num_duplicate_thresholds;
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  auto labels = torch::empty(
+      {num_combos, num_queries},
+      seed_scores.options().dtype(torch::kInt));
+  auto component_active = torch::zeros(
+      {num_combos, num_queries},
+      seed_scores.options().dtype(torch::kInt));
+  auto component_matched = torch::zeros_like(component_active);
+  auto total_matched = torch::zeros({batch_size}, seed_scores.options());
+  auto flat_shape = std::vector<int64_t>{
+      batch_size,
+      num_seed_thresholds,
+      num_duplicate_thresholds,
+  };
+  auto tp = torch::zeros(flat_shape, seed_scores.options());
+  auto fp = torch::zeros_like(tp);
+  auto fn = torch::zeros_like(tp);
+  auto changed = torch::empty({1}, seed_scores.options().dtype(torch::kInt));
+
+  long long total_labels = static_cast<long long>(num_combos) * num_queries;
+  int init_blocks = static_cast<int>((total_labels + kThreads - 1) / kThreads);
+  init_pr_labels_kernel<<<init_blocks, kThreads, 0, stream>>>(
+      seed_scores.data_ptr<float>(),
+      seed_thresholds.data_ptr<float>(),
+      labels.data_ptr<int>(),
+      num_combos,
+      num_seed_thresholds,
+      num_duplicate_thresholds,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  dim3 prop_blocks((num_queries + kThreads - 1) / kThreads, num_combos);
+  for (int iter = 0; iter < num_queries; ++iter) {
+    changed.zero_();
+    propagate_pr_labels_kernel<<<prop_blocks, kThreads, 0, stream>>>(
+        similarity.data_ptr<float>(),
+        duplicate_thresholds.data_ptr<float>(),
+        labels.data_ptr<int>(),
+        changed.data_ptr<int>(),
+        num_combos,
+        num_seed_thresholds,
+        num_duplicate_thresholds,
+        num_queries);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto changed_cpu = changed.cpu();
+    if (changed_cpu.data_ptr<int>()[0] == 0) {
+      break;
+    }
+  }
+
+  mark_pr_components_kernel<<<init_blocks, kThreads, 0, stream>>>(
+      labels.data_ptr<int>(),
+      matched_query_mask.data_ptr<bool>(),
+      component_active.data_ptr<int>(),
+      component_matched.data_ptr<int>(),
+      num_combos,
+      num_seed_thresholds,
+      num_duplicate_thresholds,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  count_total_matched_kernel<<<batch_size, kThreads, 0, stream>>>(
+      matched_query_mask.data_ptr<bool>(),
+      total_matched.data_ptr<float>(),
+      batch_size,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  reduce_pr_counts_kernel<<<num_combos, kThreads, 0, stream>>>(
+      component_active.data_ptr<int>(),
+      component_matched.data_ptr<int>(),
+      total_matched.data_ptr<float>(),
+      tp.data_ptr<float>(),
+      fp.data_ptr<float>(),
+      fn.data_ptr<float>(),
+      num_combos,
+      num_seed_thresholds,
+      num_duplicate_thresholds,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto precision = tp / (tp + fp).clamp_min(1.0);
+  auto recall = tp / (tp + fn).clamp_min(1.0);
+  auto total_tp = tp.sum(0);
+  auto total_fp = fp.sum(0);
+  auto total_fn = fn.sum(0);
+  auto micro_precision = total_tp / (total_tp + total_fp).clamp_min(1.0);
+  auto micro_recall = total_tp / (total_tp + total_fn).clamp_min(1.0);
+
+  return {
+      tp,
+      fp,
+      fn,
+      precision,
+      recall,
+      total_tp,
+      total_fp,
+      total_fn,
+      micro_precision,
+      micro_recall,
+  };
 }

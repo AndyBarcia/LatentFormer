@@ -139,6 +139,13 @@ std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
     const torch::Tensor& selected_mask,
     const torch::Tensor& similarity,
     double duplicate_threshold);
+
+std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
+    const torch::Tensor& seed_scores,
+    const torch::Tensor& matched_query_mask,
+    const torch::Tensor& seed_thresholds,
+    const torch::Tensor& duplicate_thresholds,
+    const torch::Tensor& similarity);
 #endif
 
 std::vector<torch::Tensor> clustering_seed_selection_forward(
@@ -295,6 +302,24 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
   const auto num_seed_thresholds = seed_thresholds.size(0);
   const auto num_duplicate_thresholds = duplicate_thresholds.size(0);
   const auto device = query_signatures.device();
+
+#ifdef WITH_CUDA
+  if (query_signatures.is_cuda() && query_signatures.scalar_type() == torch::kFloat) {
+    TORCH_CHECK(
+        !(matched_query_mask.to(torch::kBool).logical_and(matched_gt_indices < 0)).any().item<bool>(),
+        "matched_gt_indices must be non-negative where matched_query_mask is true");
+    auto seed_scores = query_seed_logits.to(torch::kFloat).sigmoid();
+    auto similarity = compute_similarity(query_signatures, metric, eps, temp);
+    if (seed_scores.scalar_type() == torch::kFloat && similarity.scalar_type() == torch::kFloat) {
+      return seed_cluster_precision_recall_cuda_forward(
+          seed_scores.contiguous(),
+          matched_query_mask.to(torch::kBool).contiguous(),
+          seed_thresholds.to(torch::kFloat).contiguous(),
+          duplicate_thresholds.to(torch::kFloat).contiguous(),
+          similarity.contiguous());
+    }
+  }
+#endif
 
   auto seed_scores_cpu = query_seed_logits.to(torch::kFloat).sigmoid().to(torch::kCPU).contiguous();
   auto matched_cpu = matched_query_mask.to(torch::kBool).to(torch::kCPU).contiguous();
