@@ -26,35 +26,62 @@ __global__ void propagate_labels_kernel(
     const bool* __restrict__ selected,
     const float* __restrict__ similarity,
     int* __restrict__ labels,
-    int* __restrict__ changed,
     int batch_size,
     int num_queries,
     float duplicate_threshold) {
-  int b = blockIdx.y;
-  int q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= batch_size || q >= num_queries) {
+  int b = blockIdx.x;
+  if (b >= batch_size) {
     return;
   }
+
+  extern __shared__ int shared[];
+  int* prev_labels = shared;
+  int* next_labels = shared + num_queries;
+  int* changed = shared + 2 * num_queries;
 
   int offset = b * num_queries;
-  int idx = offset + q;
-  if (!selected[idx]) {
-    return;
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    int idx = offset + q;
+    prev_labels[q] = selected[idx] ? labels[idx] : -1;
   }
+  __syncthreads();
 
-  int best = labels[idx];
-  const float* sim_row = similarity + (static_cast<long long>(b) * num_queries + q) * num_queries;
-  for (int neighbor = 0; neighbor < num_queries; ++neighbor) {
-    int neighbor_idx = offset + neighbor;
-    int neighbor_label = labels[neighbor_idx];
-    if (selected[neighbor_idx] && neighbor_label >= 0 && sim_row[neighbor] >= duplicate_threshold) {
-      best = min(best, neighbor_label);
+  for (int iter = 0; iter < num_queries; ++iter) {
+    if (threadIdx.x == 0) {
+      *changed = 0;
     }
+    __syncthreads();
+
+    for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+      int current_label = prev_labels[q];
+      int best = current_label;
+      if (current_label >= 0) {
+        const float* sim_row = similarity + (static_cast<long long>(b) * num_queries + q) * num_queries;
+        for (int neighbor = 0; neighbor < num_queries; ++neighbor) {
+          int neighbor_label = prev_labels[neighbor];
+          if (neighbor_label >= 0 && sim_row[neighbor] >= duplicate_threshold) {
+            best = min(best, neighbor_label);
+          }
+        }
+        if (best < current_label) {
+          atomicExch(changed, 1);
+        }
+      }
+      next_labels[q] = best;
+    }
+    __syncthreads();
+
+    int* tmp = prev_labels;
+    prev_labels = next_labels;
+    next_labels = tmp;
+    if (*changed == 0) {
+      break;
+    }
+    __syncthreads();
   }
 
-  if (best < labels[idx]) {
-    labels[idx] = best;
-    atomicExch(changed, 1);
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    labels[offset + q] = prev_labels[q];
   }
 }
 
@@ -173,40 +200,66 @@ __global__ void propagate_pr_labels_kernel(
     const float* __restrict__ similarity,
     const float* __restrict__ duplicate_thresholds,
     int* __restrict__ labels,
-    int* __restrict__ changed,
     int num_combos,
     int num_seed_thresholds,
     int num_duplicate_thresholds,
     int num_queries) {
-  int combo = blockIdx.y;
-  int q = blockIdx.x * blockDim.x + threadIdx.x;
-  if (combo >= num_combos || q >= num_queries) {
+  int combo = blockIdx.x;
+  if (combo >= num_combos) {
     return;
   }
 
+  extern __shared__ int shared[];
+  int* prev_labels = shared;
+  int* next_labels = shared + num_queries;
+  int* changed = shared + 2 * num_queries;
+
   int label_offset = combo * num_queries;
-  int label_idx = label_offset + q;
-  int current_label = labels[label_idx];
-  if (current_label < 0) {
-    return;
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    prev_labels[q] = labels[label_offset + q];
   }
+  __syncthreads();
 
   int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
   int duplicate_idx = combo % num_duplicate_thresholds;
   float duplicate_threshold = duplicate_thresholds[duplicate_idx];
-  const float* sim_row = similarity + (static_cast<long long>(b) * num_queries + q) * num_queries;
 
-  int best = current_label;
-  for (int neighbor = 0; neighbor < num_queries; ++neighbor) {
-    int neighbor_label = labels[label_offset + neighbor];
-    if (neighbor_label >= 0 && sim_row[neighbor] >= duplicate_threshold) {
-      best = min(best, neighbor_label);
+  for (int iter = 0; iter < num_queries; ++iter) {
+    if (threadIdx.x == 0) {
+      *changed = 0;
     }
+    __syncthreads();
+
+    for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+      int current_label = prev_labels[q];
+      int best = current_label;
+      if (current_label >= 0) {
+        const float* sim_row = similarity + (static_cast<long long>(b) * num_queries + q) * num_queries;
+        for (int neighbor = 0; neighbor < num_queries; ++neighbor) {
+          int neighbor_label = prev_labels[neighbor];
+          if (neighbor_label >= 0 && sim_row[neighbor] >= duplicate_threshold) {
+            best = min(best, neighbor_label);
+          }
+        }
+        if (best < current_label) {
+          atomicExch(changed, 1);
+        }
+      }
+      next_labels[q] = best;
+    }
+    __syncthreads();
+
+    int* tmp = prev_labels;
+    prev_labels = next_labels;
+    next_labels = tmp;
+    if (*changed == 0) {
+      break;
+    }
+    __syncthreads();
   }
 
-  if (best < current_label) {
-    labels[label_idx] = best;
-    atomicExch(changed, 1);
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    labels[label_offset + q] = prev_labels[q];
   }
 }
 
@@ -362,7 +415,6 @@ std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
   auto pad_mask = torch::zeros(
       {batch_size, num_queries},
       selected_mask.options());
-  auto changed = torch::empty({1}, query_signatures.options().dtype(torch::kInt));
 
   int total_nodes = batch_size * num_queries;
   int init_blocks = (total_nodes + kThreads - 1) / kThreads;
@@ -373,23 +425,15 @@ std::vector<torch::Tensor> clustering_seed_selection_cuda_forward(
       num_queries);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  dim3 prop_blocks((num_queries + kThreads - 1) / kThreads, batch_size);
-  for (int iter = 0; iter < num_queries; ++iter) {
-    changed.zero_();
-    propagate_labels_kernel<<<prop_blocks, kThreads, 0, stream>>>(
-        selected_mask.data_ptr<bool>(),
-        similarity.data_ptr<float>(),
-        labels.data_ptr<int>(),
-        changed.data_ptr<int>(),
-        batch_size,
-        num_queries,
-        static_cast<float>(duplicate_threshold));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto changed_cpu = changed.cpu();
-    if (changed_cpu.data_ptr<int>()[0] == 0) {
-      break;
-    }
-  }
+  size_t shared_label_bytes = static_cast<size_t>(2 * num_queries + 1) * sizeof(int);
+  propagate_labels_kernel<<<batch_size, kThreads, shared_label_bytes, stream>>>(
+      selected_mask.data_ptr<bool>(),
+      similarity.data_ptr<float>(),
+      labels.data_ptr<int>(),
+      batch_size,
+      num_queries,
+      static_cast<float>(duplicate_threshold));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   dim3 best_blocks(num_queries, batch_size);
   select_component_best_kernel<<<best_blocks, kThreads, 0, stream>>>(
@@ -459,7 +503,6 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
   auto tp = torch::zeros(flat_shape, seed_scores.options());
   auto fp = torch::zeros_like(tp);
   auto fn = torch::zeros_like(tp);
-  auto changed = torch::empty({1}, seed_scores.options().dtype(torch::kInt));
 
   long long total_labels = static_cast<long long>(num_combos) * num_queries;
   int init_blocks = static_cast<int>((total_labels + kThreads - 1) / kThreads);
@@ -473,24 +516,16 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
       num_queries);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  dim3 prop_blocks((num_queries + kThreads - 1) / kThreads, num_combos);
-  for (int iter = 0; iter < num_queries; ++iter) {
-    changed.zero_();
-    propagate_pr_labels_kernel<<<prop_blocks, kThreads, 0, stream>>>(
-        similarity.data_ptr<float>(),
-        duplicate_thresholds.data_ptr<float>(),
-        labels.data_ptr<int>(),
-        changed.data_ptr<int>(),
-        num_combos,
-        num_seed_thresholds,
-        num_duplicate_thresholds,
-        num_queries);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto changed_cpu = changed.cpu();
-    if (changed_cpu.data_ptr<int>()[0] == 0) {
-      break;
-    }
-  }
+  size_t shared_label_bytes = static_cast<size_t>(2 * num_queries + 1) * sizeof(int);
+  propagate_pr_labels_kernel<<<num_combos, kThreads, shared_label_bytes, stream>>>(
+      similarity.data_ptr<float>(),
+      duplicate_thresholds.data_ptr<float>(),
+      labels.data_ptr<int>(),
+      num_combos,
+      num_seed_thresholds,
+      num_duplicate_thresholds,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   mark_pr_components_kernel<<<init_blocks, kThreads, 0, stream>>>(
       labels.data_ptr<int>(),

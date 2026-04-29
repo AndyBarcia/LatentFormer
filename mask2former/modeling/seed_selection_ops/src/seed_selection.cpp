@@ -305,9 +305,6 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
 
 #ifdef WITH_CUDA
   if (query_signatures.is_cuda() && query_signatures.scalar_type() == torch::kFloat) {
-    TORCH_CHECK(
-        !(matched_query_mask.to(torch::kBool).logical_and(matched_gt_indices < 0)).any().item<bool>(),
-        "matched_gt_indices must be non-negative where matched_query_mask is true");
     auto seed_scores = query_seed_logits.to(torch::kFloat).sigmoid();
     auto similarity = compute_similarity(query_signatures, metric, eps, temp);
     if (seed_scores.scalar_type() == torch::kFloat && similarity.scalar_type() == torch::kFloat) {

@@ -118,7 +118,7 @@ def compute_seed_cluster_precision_recall(
 
     matched_query_mask = matched_query_mask.to(device=device, dtype=torch.bool)
     matched_gt_indices = matched_gt_indices.to(device=device)
-    if (matched_query_mask & (matched_gt_indices < 0)).any():
+    if not matched_query_mask.is_cuda and (matched_query_mask & (matched_gt_indices < 0)).any():
         raise ValueError("matched_gt_indices must be non-negative where matched_query_mask is true.")
 
     metric_name = metric.lower()
@@ -228,4 +228,3 @@ class SeedClusterPrecisionRecall(nn.Module):
             duplicate_threshold=self.duplicate_threshold,
             metric=self.metric,
         )
-

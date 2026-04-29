@@ -94,6 +94,9 @@ class ClusteringSeedSelection(SeedSelectionBase):
         seed_thresholds, duplicate_thresholds = self._sample_seed_cluster_thresholds(
             query_signatures.device
         )
+        if seed_thresholds.numel() == 0 or duplicate_thresholds.numel() == 0:
+            return query_signatures.sum() * 0.0
+
         seed_cluster_metrics = compute_seed_cluster_precision_recall(
             query_signatures=query_signatures,
             query_seed_logits=query_seed_logits,
