@@ -44,23 +44,25 @@ torch::Tensor compute_similarity(
 
 class DsuCounter {
  public:
-  DsuCounter(const std::vector<uint8_t>& active, const std::vector<uint8_t>& matched)
+  DsuCounter(
+      const std::vector<uint8_t>& active,
+      const std::vector<uint8_t>& matched,
+      const std::vector<float>& scores)
       : parent_(active.size()),
         rank_(active.size(), 0),
         active_(active),
-        has_match_(matched),
+        matched_(matched),
+        best_index_(active.size()),
+        best_score_(scores),
         tp_(0),
         fp_(0) {
     std::iota(parent_.begin(), parent_.end(), 0);
+    std::iota(best_index_.begin(), best_index_.end(), 0);
     for (size_t idx = 0; idx < active_.size(); ++idx) {
       if (!active_[idx]) {
         continue;
       }
-      if (has_match_[idx]) {
-        ++tp_;
-      } else {
-        ++fp_;
-      }
+      add_component(idx);
     }
   }
 
@@ -93,7 +95,12 @@ class DsuCounter {
       ++rank_[lhs_root];
     }
     active_[lhs_root] = 1;
-    has_match_[lhs_root] = has_match_[lhs_root] || has_match_[rhs_root];
+    if (best_score_[rhs_root] > best_score_[lhs_root] ||
+        (best_score_[rhs_root] == best_score_[lhs_root] &&
+         best_index_[rhs_root] < best_index_[lhs_root])) {
+      best_score_[lhs_root] = best_score_[rhs_root];
+      best_index_[lhs_root] = best_index_[rhs_root];
+    }
     add_component(lhs_root);
   }
 
@@ -107,7 +114,7 @@ class DsuCounter {
 
  private:
   void remove_component(int64_t root) {
-    if (has_match_[root]) {
+    if (matched_[best_index_[root]]) {
       --tp_;
     } else {
       --fp_;
@@ -115,7 +122,7 @@ class DsuCounter {
   }
 
   void add_component(int64_t root) {
-    if (has_match_[root]) {
+    if (matched_[best_index_[root]]) {
       ++tp_;
     } else {
       ++fp_;
@@ -125,7 +132,9 @@ class DsuCounter {
   std::vector<int64_t> parent_;
   std::vector<uint8_t> rank_;
   std::vector<uint8_t> active_;
-  std::vector<uint8_t> has_match_;
+  std::vector<uint8_t> matched_;
+  std::vector<int64_t> best_index_;
+  std::vector<float> best_score_;
   int64_t tp_;
   int64_t fp_;
 };
@@ -380,8 +389,10 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
     });
 
     std::vector<uint8_t> matched(num_queries, 0);
+    std::vector<float> scores(num_queries, 0.0f);
     for (int64_t q = 0; q < num_queries; ++q) {
       matched[q] = matched_a[b][q] ? 1 : 0;
+      scores[q] = scores_a[b][q];
     }
 
     for (const int64_t seed_idx : seed_order) {
@@ -391,7 +402,7 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_forward(
         active[q] = scores_a[b][q] >= seed_threshold ? 1 : 0;
       }
 
-      DsuCounter dsu(active, matched);
+      DsuCounter dsu(active, matched, scores);
       size_t edge_cursor = 0;
       for (const int64_t duplicate_idx : duplicate_order) {
         const float duplicate_threshold = duplicate_thresholds_a[duplicate_idx];

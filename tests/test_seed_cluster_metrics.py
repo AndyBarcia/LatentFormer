@@ -36,6 +36,29 @@ def test_seed_cluster_metrics_counts_duplicate_and_unmatched_components():
     assert torch.isclose(metrics["recall"], torch.tensor([[[1.0 / 3.0]]])).all()
 
 
+def test_seed_cluster_metrics_uses_highest_seed_query_for_component_tp():
+    query_signatures = torch.tensor([[[1.0, 0.0], [0.9, 0.1]]])
+    query_seed_logits = torch.tensor([[10.0, 5.0]])
+    matched_query_mask = torch.tensor([[False, True]])
+    matched_gt_indices = torch.tensor([[-1, 0]])
+
+    metrics = compute_seed_cluster_precision_recall(
+        query_signatures=query_signatures,
+        query_seed_logits=query_seed_logits,
+        matched_query_mask=matched_query_mask,
+        matched_gt_indices=matched_gt_indices,
+        seed_threshold=0.5,
+        duplicate_threshold=0.8,
+        metric="cosine",
+    )
+
+    assert metrics["tp"].item() == 0.0
+    assert metrics["fp"].item() == 1.0
+    assert metrics["fn"].item() == 1.0
+    assert torch.isclose(metrics["precision"], torch.tensor([[[0.0]]])).all()
+    assert torch.isclose(metrics["recall"], torch.tensor([[[0.0]]])).all()
+
+
 def test_seed_cluster_metrics_sweeps_thresholds():
     query_signatures = torch.tensor(
         [

@@ -265,12 +265,8 @@ __global__ void propagate_pr_labels_kernel(
 
 __global__ void mark_pr_components_kernel(
     const int* __restrict__ labels,
-    const bool* __restrict__ matched,
     int* __restrict__ component_active,
-    int* __restrict__ component_matched,
     int num_combos,
-    int num_seed_thresholds,
-    int num_duplicate_thresholds,
     int num_queries) {
   long long total = static_cast<long long>(num_combos) * num_queries;
   long long linear = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
@@ -278,18 +274,69 @@ __global__ void mark_pr_components_kernel(
     return;
   }
 
-  int q = linear % num_queries;
   int combo = linear / num_queries;
   int root = labels[linear];
   if (root < 0) {
     return;
   }
 
-  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
   int component_idx = combo * num_queries + root;
   atomicExch(component_active + component_idx, 1);
-  if (matched[b * num_queries + q]) {
-    atomicExch(component_matched + component_idx, 1);
+}
+
+__global__ void select_pr_component_best_kernel(
+    const int* __restrict__ labels,
+    const float* __restrict__ scores,
+    int* __restrict__ best_indices,
+    int num_combos,
+    int num_seed_thresholds,
+    int num_duplicate_thresholds,
+    int num_queries) {
+  int combo = blockIdx.y;
+  int root = blockIdx.x;
+  if (combo >= num_combos || root >= num_queries) {
+    return;
+  }
+
+  __shared__ float thread_scores[kThreads];
+  __shared__ int thread_indices[kThreads];
+
+  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
+  int label_offset = combo * num_queries;
+  int score_offset = b * num_queries;
+  float best_score = -1.0f;
+  int best_idx = -1;
+  for (int q = threadIdx.x; q < num_queries; q += blockDim.x) {
+    if (labels[label_offset + q] == root) {
+      float score = scores[score_offset + q];
+      if (score > best_score || (score == best_score && (best_idx < 0 || q < best_idx))) {
+        best_score = score;
+        best_idx = q;
+      }
+    }
+  }
+
+  thread_scores[threadIdx.x] = best_score;
+  thread_indices[threadIdx.x] = best_idx;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      float other_score = thread_scores[threadIdx.x + stride];
+      int other_idx = thread_indices[threadIdx.x + stride];
+      if (other_score > thread_scores[threadIdx.x] ||
+          (other_score == thread_scores[threadIdx.x] &&
+           other_idx >= 0 &&
+           (thread_indices[threadIdx.x] < 0 || other_idx < thread_indices[threadIdx.x]))) {
+        thread_scores[threadIdx.x] = other_score;
+        thread_indices[threadIdx.x] = other_idx;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0 && thread_indices[0] >= 0) {
+    best_indices[combo * num_queries + root] = thread_indices[0];
   }
 }
 
@@ -327,7 +374,8 @@ __global__ void count_total_matched_kernel(
 
 __global__ void reduce_pr_counts_kernel(
     const int* __restrict__ component_active,
-    const int* __restrict__ component_matched,
+    const int* __restrict__ component_best_indices,
+    const bool* __restrict__ matched,
     const float* __restrict__ total_matched,
     float* __restrict__ tp,
     float* __restrict__ fp,
@@ -346,10 +394,12 @@ __global__ void reduce_pr_counts_kernel(
   int local_tp = 0;
   int local_fp = 0;
   int component_offset = combo * num_queries;
+  int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
   for (int root = threadIdx.x; root < num_queries; root += blockDim.x) {
     int idx = component_offset + root;
     if (component_active[idx]) {
-      if (component_matched[idx]) {
+      int best_idx = component_best_indices[idx];
+      if (best_idx >= 0 && matched[b * num_queries + best_idx]) {
         ++local_tp;
       } else {
         ++local_fp;
@@ -370,7 +420,6 @@ __global__ void reduce_pr_counts_kernel(
   }
 
   if (threadIdx.x == 0) {
-    int b = combo / (num_seed_thresholds * num_duplicate_thresholds);
     float image_tp = static_cast<float>(thread_tp[0]);
     float image_fp = static_cast<float>(thread_fp[0]);
     tp[combo] = image_tp;
@@ -493,7 +542,10 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
   auto component_active = torch::zeros(
       {num_combos, num_queries},
       seed_scores.options().dtype(torch::kInt));
-  auto component_matched = torch::zeros_like(component_active);
+  auto component_best_indices = torch::full(
+      {num_combos, num_queries},
+      -1,
+      seed_scores.options().dtype(torch::kInt));
   auto total_matched = torch::zeros({batch_size}, seed_scores.options());
   auto flat_shape = std::vector<int64_t>{
       batch_size,
@@ -529,9 +581,16 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
 
   mark_pr_components_kernel<<<init_blocks, kThreads, 0, stream>>>(
       labels.data_ptr<int>(),
-      matched_query_mask.data_ptr<bool>(),
       component_active.data_ptr<int>(),
-      component_matched.data_ptr<int>(),
+      num_combos,
+      num_queries);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  dim3 pr_best_blocks(num_queries, num_combos);
+  select_pr_component_best_kernel<<<pr_best_blocks, kThreads, 0, stream>>>(
+      labels.data_ptr<int>(),
+      seed_scores.data_ptr<float>(),
+      component_best_indices.data_ptr<int>(),
       num_combos,
       num_seed_thresholds,
       num_duplicate_thresholds,
@@ -547,7 +606,8 @@ std::vector<torch::Tensor> seed_cluster_precision_recall_cuda_forward(
 
   reduce_pr_counts_kernel<<<num_combos, kThreads, 0, stream>>>(
       component_active.data_ptr<int>(),
-      component_matched.data_ptr<int>(),
+      component_best_indices.data_ptr<int>(),
+      matched_query_mask.data_ptr<bool>(),
       total_matched.data_ptr<float>(),
       tp.data_ptr<float>(),
       fp.data_ptr<float>(),

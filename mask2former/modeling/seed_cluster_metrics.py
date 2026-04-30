@@ -40,6 +40,7 @@ def _connected_component_stats(
     adjacency: torch.Tensor,
     selected: torch.Tensor,
     matched: torch.Tensor,
+    seed_scores: torch.Tensor,
 ) -> tuple[int, int]:
     visited = torch.zeros_like(selected)
     tp = 0
@@ -49,20 +50,24 @@ def _connected_component_stats(
         if visited[start]:
             continue
 
-        has_match = False
+        best_idx = start
+        best_score = float(seed_scores[start])
         stack = [start]
         visited[start] = True
 
         while stack:
             current = stack.pop()
-            has_match = has_match or bool(matched[current])
+            current_score = float(seed_scores[current])
+            if current_score > best_score or (current_score == best_score and current < best_idx):
+                best_idx = current
+                best_score = current_score
             neighbors = adjacency[current].nonzero(as_tuple=False).flatten().tolist()
             for neighbor in neighbors:
                 if not visited[neighbor]:
                     visited[neighbor] = True
                     stack.append(neighbor)
 
-        if has_match:
+        if matched[best_idx]:
             tp += 1
         else:
             fp += 1
@@ -84,9 +89,11 @@ def compute_seed_cluster_precision_recall(
 
     Queries above ``seed_threshold`` are graph vertices. Edges connect selected
     queries whose signature similarity is at least ``duplicate_threshold``.
-    A connected component contributes one TP if it contains any matched query,
-    otherwise one FP. Matched queries not represented by that one TP are FNs,
-    so merged matched queries in the same component count as duplicates.
+    A connected component contributes one prediction: the selected query with
+    the highest seed score in that component, matching inference behavior. The
+    component is a TP only when that highest-scoring query is matched; otherwise
+    it is an FP. Matched queries not represented by a TP are FNs, so lower-scored
+    matched queries in the same component count as missed duplicates.
     """
     if query_signatures.dim() != 3:
         raise ValueError(f"query_signatures must be shaped [B,Q,C], got {tuple(query_signatures.shape)}.")
@@ -122,7 +129,7 @@ def compute_seed_cluster_precision_recall(
         raise ValueError("matched_gt_indices must be non-negative where matched_query_mask is true.")
 
     metric_name = metric.lower()
-    if metric_name in _NATIVE_SUPPORTED_METRICS:
+    if query_signatures.is_cuda and metric_name in _NATIVE_SUPPORTED_METRICS:
         native_result = seed_cluster_precision_recall_native(
             query_signatures,
             query_seed_logits,
@@ -168,6 +175,7 @@ def compute_seed_cluster_precision_recall(
                     adjacency[batch_idx],
                     selected_mask[batch_idx],
                     matched_query_mask[batch_idx],
+                    seed_scores[batch_idx],
                 )
                 tp[batch_idx, seed_idx, duplicate_idx] = image_tp
                 fp[batch_idx, seed_idx, duplicate_idx] = image_fp
