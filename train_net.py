@@ -50,7 +50,6 @@ from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
     COCOEvaluator,
-    COCOPanopticEvaluator,
     DatasetEvaluators,
     LVISEvaluator,
     SemSegEvaluator,
@@ -65,6 +64,7 @@ from detectron2.utils.logger import setup_logger
 from mask2former import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
+    COCOPanopticEvaluator,
     InstanceSegEvaluator,
     LatentFormerSignatureEvaluator,
     MaskFormerInstanceDatasetMapper,
