@@ -209,7 +209,11 @@ class LatentCriterion(nn.Module):
             return {"loss_sem_mask": zero, "loss_sem_dice": zero}
 
         semantic_targets = targets["semantic_masks"]
-        semantic_pad_mask = semantic_targets.flatten(2).sum(dim=-1) > 0
+        semantic_pad_mask = torch.ones(
+            semantic_targets.shape[:2],
+            dtype=torch.bool,
+            device=semantic_targets.device,
+        )
         num_semantic_masks = self._get_global_normalizer(semantic_pad_mask.sum())
         return self._soft_mask_losses(
             outputs["semantic_masks"],

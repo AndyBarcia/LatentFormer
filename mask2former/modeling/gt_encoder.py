@@ -106,9 +106,4 @@ class GroundTruthEncoder(nn.Module):
         return self.gt_class_proj(labels)
 
     def all_class_signatures(self) -> torch.Tensor:
-        class_ids = torch.arange(
-            self.num_classes,
-            device=self.gt_class_proj.weight.device,
-            dtype=torch.long,
-        )
-        return self.gt_class_proj(class_ids)
+        return self.gt_class_proj.weight[: self.num_classes]
