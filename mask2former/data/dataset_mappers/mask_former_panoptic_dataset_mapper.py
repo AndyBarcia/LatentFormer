@@ -16,6 +16,13 @@ from .mask_former_semantic_dataset_mapper import MaskFormerSemanticDatasetMapper
 __all__ = ["MaskFormerPanopticDatasetMapper"]
 
 
+def build_semantic_from_panoptic(pan_seg_gt, segments_info, ignore_label):
+    sem_seg_gt = np.full(pan_seg_gt.shape, ignore_label, dtype=np.int64)
+    for segment_info in segments_info:
+        sem_seg_gt[pan_seg_gt == segment_info["id"]] = segment_info["category_id"]
+    return sem_seg_gt
+
+
 class MaskFormerPanopticDatasetMapper(MaskFormerSemanticDatasetMapper):
     """
     A callable which takes a dataset dict in Detectron2 Dataset format,
@@ -104,11 +111,15 @@ class MaskFormerPanopticDatasetMapper(MaskFormerSemanticDatasetMapper):
         from panopticapi.utils import rgb2id
 
         pan_seg_gt = rgb2id(pan_seg_gt)
+        sem_seg_gt = build_semantic_from_panoptic(
+            pan_seg_gt,
+            segments_info,
+            self.ignore_label,
+        )
 
         # Pad image and segmentation label here!
         image = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
-        if sem_seg_gt is not None:
-            sem_seg_gt = torch.as_tensor(sem_seg_gt.astype("long"))
+        sem_seg_gt = torch.as_tensor(sem_seg_gt.astype("long"))
         pan_seg_gt = torch.as_tensor(pan_seg_gt.astype("long"))
 
         if self.size_divisibility > 0:

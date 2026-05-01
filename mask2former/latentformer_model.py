@@ -74,47 +74,65 @@ class LatentAggregator(nn.Module):
 
     def forward(
         self,
-        query_class_logits: torch.Tensor,
         query_mask_embeddings: torch.Tensor,
-        query_signatures: torch.Tensor,
+        query_mask_signatures: torch.Tensor,
+        query_class_signatures: torch.Tensor,
         query_seed_logits: torch.Tensor,
-        seed_signatures: torch.Tensor,
+        seed_mask_signatures: torch.Tensor,
         *,
+        class_signatures: torch.Tensor,
         mask_features,
         target_pad_mask: torch.Tensor = None,
     ):
-        q_cls_flat = self._flatten_layer_queries(query_class_logits, "query_class_logits")
         q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
-        q_sig_flat = self._flatten_layer_queries(query_signatures, "query_signatures")
+        q_mask_sig_flat = self._flatten_layer_queries(query_mask_signatures, "query_mask_signatures")
+        q_class_sig_flat = self._flatten_layer_queries(query_class_signatures, "query_class_signatures")
         q_seed_logits_flat = self._flatten_layer_logits(query_seed_logits, "query_seed_logits")
         non_seed_gate = 1.0 - q_seed_logits_flat.float().sigmoid()
 
-        sim = pairwise_similarity(
-            q_sig_flat,
-            seed_signatures,
+        object_sim = pairwise_similarity(
+            q_mask_sig_flat,
+            seed_mask_signatures,
             metric=self.aggregation_similarity_metric,
         )
-        weights_flat = assignment_weights_from_similarity(
-            similarity=sim,
+        object_weights_flat = assignment_weights_from_similarity(
+            similarity=object_sim,
             valid_mask=target_pad_mask,
         )
-        weights_flat = weights_flat * non_seed_gate.to(dtype=weights_flat.dtype).unsqueeze(-1)
-        norm_w = normalize_assignment_weights(weights_flat)
+        object_weights_flat = object_weights_flat * non_seed_gate.to(
+            dtype=object_weights_flat.dtype
+        ).unsqueeze(-1)
+        object_norm_w = normalize_assignment_weights(object_weights_flat)
 
-        proto_mask_emb = aggregate_with_weights(norm_w, q_mask_emb_flat)
-        proto_cls = aggregate_with_weights(norm_w, q_cls_flat)
-        proto_masks = [torch.einsum("bsc,bchw->bshw", proto_mask_emb, feature) for feature in mask_features]
+        object_mask_emb = aggregate_with_weights(object_norm_w, q_mask_emb_flat)
+        object_masks = [
+            torch.einsum("bsc,bchw->bshw", object_mask_emb, feature) for feature in mask_features
+        ]
+
+        class_signatures = class_signatures.to(device=q_class_sig_flat.device, dtype=q_class_sig_flat.dtype)
+        class_signatures = class_signatures.unsqueeze(0).expand(q_class_sig_flat.shape[0], -1, -1)
+        semantic_sim = pairwise_similarity(
+            q_class_sig_flat,
+            class_signatures,
+            metric=self.aggregation_similarity_metric,
+        )
+        semantic_weights = normalize_assignment_weights(
+            assignment_weights_from_similarity(similarity=semantic_sim)
+        )
+        semantic_mask_emb = aggregate_with_weights(semantic_weights, q_mask_emb_flat)
+        semantic_masks = [
+            torch.einsum("bsc,bchw->bshw", semantic_mask_emb, feature) for feature in mask_features
+        ]
 
         if target_pad_mask is not None:
-            valid = target_pad_mask.unsqueeze(-1).to(dtype=proto_cls.dtype)
-            proto_cls = proto_cls * valid
-            proto_mask_emb = proto_mask_emb * valid
-            proto_masks = [
+            valid = target_pad_mask.unsqueeze(-1).to(dtype=object_mask_emb.dtype)
+            object_mask_emb = object_mask_emb * valid
+            object_masks = [
                 masks * target_pad_mask[:, :, None, None].to(dtype=masks.dtype)
-                for masks in proto_masks
+                for masks in object_masks
             ]
 
-        return proto_cls, proto_masks, proto_mask_emb
+        return object_masks, semantic_masks, object_mask_emb, semantic_mask_emb
 
 
 @META_ARCH_REGISTRY.register()
@@ -177,7 +195,6 @@ class LatentFormer(nn.Module):
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         matcher = LatentMatcher(similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,)
 
-        class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         gt_sep_weight = cfg.MODEL.LATENT_FORMER.GT_SEP_WEIGHT
@@ -186,9 +203,10 @@ class LatentFormer(nn.Module):
         seed_weight_pattern_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT_PATTERN_WEIGHT
         seed_cluster_pr_weight = cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR_WEIGHT
         weight_dict = {
-            "loss_ce": class_weight,
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
+            "loss_sem_mask": mask_weight,
+            "loss_sem_dice": dice_weight,
             "loss_gt_sep": gt_sep_weight,
             "loss_seed": seed_weight,
             "loss_seed_sig": seed_sig_weight,
@@ -218,7 +236,7 @@ class LatentFormer(nn.Module):
             sem_seg_head.num_classes,
             matcher=matcher,
             weight_dict=weight_dict,
-            losses=["labels", "masks", "gt_sep", "seed"],
+            losses=["masks", "semantic_masks", "gt_sep", "seed"],
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
@@ -274,6 +292,7 @@ class LatentFormer(nn.Module):
             features,
             mask=image_padding_mask(images),
         )
+        outputs["class_signatures"] = self.gt_encoder.all_class_signatures()
 
         if self._needs_gt_signatures():
             targets = self._prepare_gt_signatures(batched_inputs, images, outputs)
@@ -281,19 +300,21 @@ class LatentFormer(nn.Module):
             targets = None
 
         if self.training:
-            proto_cls, proto_masks, proto_mask_emb = self.aggregator(
-                outputs["pred_logits"],
+            object_masks, semantic_masks, object_mask_emb, semantic_mask_emb = self.aggregator(
                 outputs["pred_masks"],
-                outputs["pred_signatures"],
+                outputs["pred_mask_signatures"],
+                outputs["pred_class_signatures"],
                 outputs["pred_seed_logits"],
-                outputs["gt_signatures"],
+                outputs["gt_mask_signatures"],
+                class_signatures=outputs["class_signatures"],
                 mask_features=outputs["mask_features"],
                 target_pad_mask=targets["pad_mask"],
             )
 
-            outputs["proto_cls"] = proto_cls
-            outputs["proto_masks"] = proto_masks
-            outputs["proto_mask_emb"] = proto_mask_emb
+            outputs["object_masks"] = object_masks
+            outputs["semantic_masks"] = semantic_masks
+            outputs["object_mask_emb"] = object_mask_emb
+            outputs["semantic_mask_emb"] = semantic_mask_emb
             outputs["clustering_seed_selection"] = self.seed_selection_modules[
                 "ClusteringSeedSelection"
             ]
@@ -329,23 +350,24 @@ class LatentFormer(nn.Module):
             )
 
         gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-        targets = self.prepare_gt_encoder_inputs(gt_instances, images)
-        outputs["gt_signatures"] = self.gt_encoder(
+        targets = self.prepare_gt_encoder_inputs(gt_instances, images, batched_inputs)
+        outputs["gt_mask_signatures"] = self.gt_encoder(
             outputs["mask_features"],
             targets["masks"],
-            targets["labels"],
             targets["boxes"],
             targets["pad_mask"],
         )
+        outputs["gt_class_signatures"] = self.gt_encoder.class_signatures(targets["labels"])
+        outputs["class_signatures"] = self.gt_encoder.all_class_signatures()
         return targets
 
     def inference(self, outputs, batched_inputs, image_sizes, padded_image_size, targets=None):
         mode_results = {}
         for mode, seed_selection in self.seed_selection_modules.items():
-            gt_signatures = outputs.get("gt_signatures")
+            gt_signatures = outputs.get("gt_mask_signatures")
             gt_pad_mask = targets["pad_mask"] if targets is not None else None
             seed_signatures, seed_pad_mask, seed_scores = seed_selection(
-                outputs["pred_signatures"],
+                outputs["pred_mask_signatures"],
                 outputs["pred_seed_logits"],
                 gt_signatures=gt_signatures,
                 gt_pad_mask=gt_pad_mask,
@@ -376,19 +398,30 @@ class LatentFormer(nn.Module):
         seed_scores,
         targets=None,
     ):
-        proto_cls, proto_masks, _ = self.aggregator(
-            outputs["pred_logits"],
+        object_masks, semantic_masks, _, _ = self.aggregator(
             outputs["pred_masks"],
-            outputs["pred_signatures"],
+            outputs["pred_mask_signatures"],
+            outputs["pred_class_signatures"],
             outputs["pred_seed_logits"],
             seed_signatures,
+            class_signatures=outputs["class_signatures"],
             mask_features=outputs["mask_features"],
             target_pad_mask=seed_pad_mask,
         )
 
-        mask_pred_results = max(proto_masks, key=lambda masks: masks.shape[-2] * masks.shape[-1])
+        mask_pred_results = max(object_masks, key=lambda masks: masks.shape[-2] * masks.shape[-1])
         mask_pred_results = F.interpolate(
             mask_pred_results,
+            size=padded_image_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        semantic_pred_results = max(
+            semantic_masks,
+            key=lambda masks: masks.shape[-2] * masks.shape[-1],
+        )
+        semantic_pred_results = F.interpolate(
+            semantic_pred_results,
             size=padded_image_size,
             mode="bilinear",
             align_corners=False,
@@ -399,8 +432,19 @@ class LatentFormer(nn.Module):
             batched_inputs,
             image_sizes,
         )
-        proto_cls = proto_cls.to(mask_pred_results)
+        semantic_pred_results, _ = self._prepare_batched_mask_predictions(
+            semantic_pred_results,
+            batched_inputs,
+            image_sizes,
+        )
+        semantic_pred_results = semantic_pred_results.to(mask_pred_results)
         spatial_valid_mask = self._spatial_valid_mask(output_sizes, mask_pred_results)
+        object_class_scores = self.batched_object_class_scores(
+            semantic_pred_results,
+            mask_pred_results,
+            seed_pad_mask,
+            spatial_valid_mask,
+        )
 
         processed_results = [{} for _ in batched_inputs]
         sem_seg_results = None
@@ -408,30 +452,28 @@ class LatentFormer(nn.Module):
         instance_results = None
         if self.semantic_on:
             sem_seg_results = retry_if_cuda_oom(self.batched_semantic_inference)(
-                proto_cls,
-                mask_pred_results,
-                seed_pad_mask,
+                semantic_pred_results,
             )
             sem_seg_results = sem_seg_results * spatial_valid_mask[:, None].to(dtype=sem_seg_results.dtype)
         if self.panoptic_on:
             panoptic_results = retry_if_cuda_oom(self.batched_panoptic_inference)(
-                proto_cls,
+                object_class_scores,
                 mask_pred_results,
                 seed_pad_mask,
                 spatial_valid_mask,
             )
         if self.instance_on:
             instance_results = retry_if_cuda_oom(self.batched_instance_inference)(
-                proto_cls,
+                object_class_scores,
                 mask_pred_results,
                 seed_pad_mask,
                 spatial_valid_mask,
             )
 
-        if self.signature_on and targets is not None and "gt_signatures" in outputs:
+        if self.signature_on and targets is not None and "gt_mask_signatures" in outputs:
             query_signatures = LatentAggregator._flatten_layer_queries(
-                outputs["pred_signatures"],
-                "pred_signatures",
+                outputs["pred_mask_signatures"],
+                "pred_mask_signatures",
             )
             query_seed_scores = self._flatten_layer_logits(
                 outputs["pred_seed_logits"],
@@ -470,10 +512,10 @@ class LatentFormer(nn.Module):
                 cropped_instances.pred_classes = instances.pred_classes
                 processed_results[idx]["instances"] = cropped_instances
 
-            if self.signature_on and targets is not None and "gt_signatures" in outputs:
+            if self.signature_on and targets is not None and "gt_mask_signatures" in outputs:
                 gt_pad_mask = targets["pad_mask"][idx]
                 processed_results[idx]["latentformer_signature_eval"] = {
-                    "gt_signatures": outputs["gt_signatures"][idx, gt_pad_mask].detach().cpu(),
+                    "gt_signatures": outputs["gt_mask_signatures"][idx, gt_pad_mask].detach().cpu(),
                     "det_signatures": query_signatures[idx].detach().cpu(),
                     "det_seed_scores": query_seed_scores[idx].detach().cpu(),
                     "selected_seed_signatures": seed_signatures[idx, seed_pad_mask[idx]].detach().cpu(),
@@ -535,32 +577,44 @@ class LatentFormer(nn.Module):
         mask_logits = mask_pred.masked_fill(~seed_pad_mask[:, :, None, None], torch.finfo(mask_pred.dtype).min)
         return F.softmax(mask_logits, dim=1)
 
-    def batched_semantic_inference(self, mask_cls, mask_pred, seed_pad_mask):
-        if mask_cls.shape[1] == 0:
-            return mask_pred.new_zeros((mask_pred.shape[0], self.sem_seg_head.num_classes, *mask_pred.shape[-2:]))
-        class_probs = F.softmax(mask_cls, dim=-1)[..., :-1]
-        class_probs = class_probs * seed_pad_mask[:, :, None].to(dtype=class_probs.dtype)
-        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
-        return torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
+    def batched_semantic_inference(self, semantic_pred):
+        return F.softmax(semantic_pred, dim=1)
 
-    def batched_panoptic_inference(self, mask_cls, mask_pred, seed_pad_mask, spatial_valid_mask):
+    def batched_object_class_scores(
+        self,
+        semantic_pred,
+        mask_pred,
+        seed_pad_mask,
+        spatial_valid_mask,
+    ):
+        batch_size, num_seeds = mask_pred.shape[:2]
+        if num_seeds == 0:
+            return mask_pred.new_zeros((batch_size, 0, self.sem_seg_head.num_classes))
+        class_probs = F.softmax(semantic_pred, dim=1)
+        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        mask_probs = mask_probs * spatial_valid_mask[:, None].to(dtype=mask_probs.dtype)
+        denom = mask_probs.flatten(2).sum(dim=-1).clamp_min(1e-6)
+        scores = torch.einsum("bchw,bqhw->bqc", class_probs, mask_probs)
+        scores = scores / denom[:, :, None]
+        return scores * seed_pad_mask[:, :, None].to(dtype=scores.dtype)
+
+    def batched_panoptic_inference(self, class_scores, mask_pred, seed_pad_mask, spatial_valid_mask):
         batch_size, _, height, width = mask_pred.shape
-        if mask_cls.shape[1] == 0:
+        if class_scores.shape[1] == 0:
             empty = mask_pred.new_zeros((height, width), dtype=torch.int32)
             return [(empty.clone(), []) for _ in range(batch_size)]
 
-        scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        scores, labels = class_scores.max(-1)
         mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
         keep = (
             seed_pad_mask
-            & labels.ne(self.sem_seg_head.num_classes)
             & (scores > self.score_threshold)
         )
         prob_masks = scores[:, :, None, None] * mask_probs
         prob_masks = prob_masks.masked_fill(~seed_pad_mask[:, :, None, None], -1.0)
         prob_masks = prob_masks.masked_fill(~spatial_valid_mask[:, None], -1.0)
         mask_ids = prob_masks.argmax(dim=1)
-        seed_ids = torch.arange(mask_cls.shape[1], device=mask_pred.device)
+        seed_ids = torch.arange(class_scores.shape[1], device=mask_pred.device)
         assigned_masks = (mask_ids[:, None] == seed_ids[None, :, None, None]) & spatial_valid_mask[:, None]
         final_masks = assigned_masks & (mask_probs >= 0.5)
         mask_areas = assigned_masks.flatten(2).sum(2)
@@ -608,13 +662,13 @@ class LatentFormer(nn.Module):
 
         return results
 
-    def batched_instance_inference(self, mask_cls, mask_pred, seed_pad_mask, spatial_valid_mask):
+    def batched_instance_inference(self, class_scores, mask_pred, seed_pad_mask, spatial_valid_mask):
         batch_size, num_seeds, height, width = mask_pred.shape
         image_size = (height, width)
         if num_seeds == 0:
             return [self._empty_instances(image_size, mask_pred) for _ in range(batch_size)]
 
-        scores = F.softmax(mask_cls, dim=-1)[:, :, :-1]
+        scores = class_scores
         scores = scores.masked_fill(~seed_pad_mask[:, :, None], -1.0)
         k = min(self.test_topk_per_image, scores.shape[1] * scores.shape[2])
         scores_per_image, topk_indices = scores.flatten(1, 2).topk(k, dim=1, sorted=False)
@@ -666,7 +720,7 @@ class LatentFormer(nn.Module):
         result.pred_classes = torch.zeros((0,), dtype=torch.long, device=mask_pred.device)
         return result
 
-    def prepare_gt_encoder_inputs(self, targets, images):
+    def prepare_gt_encoder_inputs(self, targets, images, batched_inputs=None):
         h_pad, w_pad = images.tensor.shape[-2:]
         background_label = self.gt_encoder.background_label
         max_instances = max(
@@ -738,4 +792,53 @@ class LatentFormer(nn.Module):
             )
             pad_mask[idx, :num_instances] = True
 
-        return {"masks": masks, "labels": labels, "boxes": boxes, "pad_mask": pad_mask}
+        result = {"masks": masks, "labels": labels, "boxes": boxes, "pad_mask": pad_mask}
+        semantic_masks = self.prepare_semantic_targets(batched_inputs, targets, images)
+        if semantic_masks is not None:
+            result["semantic_masks"] = semantic_masks
+        return result
+
+    def prepare_semantic_targets(self, batched_inputs, targets, images):
+        if batched_inputs is None:
+            return None
+
+        h_pad, w_pad = images.tensor.shape[-2:]
+        semantic_masks = torch.zeros(
+            (len(batched_inputs), self.sem_seg_head.num_classes, h_pad, w_pad),
+            dtype=images.tensor.dtype,
+            device=self.device,
+        )
+        has_semantic_gt = False
+
+        for idx, input_per_image in enumerate(batched_inputs):
+            if "sem_seg" in input_per_image:
+                sem_seg = input_per_image["sem_seg"].to(device=self.device)
+                sem_h = min(sem_seg.shape[-2], h_pad)
+                sem_w = min(sem_seg.shape[-1], w_pad)
+                sem_seg = sem_seg[:sem_h, :sem_w]
+                valid = (sem_seg >= 0) & (sem_seg < self.sem_seg_head.num_classes)
+                if valid.any():
+                    class_ids = sem_seg[valid].long()
+                    rows, cols = valid.nonzero(as_tuple=True)
+                    semantic_masks[idx, class_ids, rows, cols] = 1.0
+                    has_semantic_gt = True
+                continue
+
+            targets_per_image = targets[idx]
+            if len(targets_per_image.gt_classes) == 0:
+                continue
+            gt_masks = targets_per_image.gt_masks
+            if hasattr(gt_masks, "tensor"):
+                gt_masks = gt_masks.tensor
+            gt_masks = gt_masks.to(device=self.device, dtype=semantic_masks.dtype)
+            for class_id, mask in zip(targets_per_image.gt_classes.tolist(), gt_masks):
+                if 0 <= class_id < self.sem_seg_head.num_classes:
+                    semantic_masks[idx, class_id, : mask.shape[-2], : mask.shape[-1]] = torch.maximum(
+                        semantic_masks[idx, class_id, : mask.shape[-2], : mask.shape[-1]],
+                        mask,
+                    )
+                    has_semantic_gt = True
+
+        if not has_semantic_gt:
+            return None
+        return semantic_masks

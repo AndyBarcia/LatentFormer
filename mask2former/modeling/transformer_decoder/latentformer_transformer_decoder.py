@@ -113,7 +113,6 @@ class LatentTransformerDecoder(nn.Module):
         use_attention_residuals: bool = True,
     ):
         super().__init__()
-        assert mask_classification, "LatentFormer always uses a class head."
         assert num_feature_levels >= 1, "LatentFormer requires at least one feature level."
 
         self.mask_classification = mask_classification
@@ -170,9 +169,13 @@ class LatentTransformerDecoder(nn.Module):
             else:
                 self.input_proj.append(nn.Sequential())
 
-        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, in_channels, 3)
-        self.sig_head = nn.Sequential(
+        self.mask_sig_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
+        )
+        self.class_sig_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
@@ -224,9 +227,9 @@ class LatentTransformerDecoder(nn.Module):
         output = self.query_feat.weight.unsqueeze(0).repeat(bs, 1, 1)
         history = [output]
 
-        predictions_class = []
         predictions_mask = []
-        predictions_sig = []
+        predictions_mask_sig = []
+        predictions_class_sig = []
         predictions_seed = []
         _, _, _, _, attn_biases = self.forward_prediction_heads(
             output, multi_scale_features, padding_masks
@@ -256,26 +259,26 @@ class LatentTransformerDecoder(nn.Module):
             )
             history.append(output)
 
-            outputs_class, outputs_mask, outputs_sig, outputs_seed, attn_biases = (
+            outputs_mask, outputs_mask_sig, outputs_class_sig, outputs_seed, attn_biases = (
                 self.forward_prediction_heads(output, multi_scale_features, padding_masks)
             )
-            predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
-            predictions_sig.append(outputs_sig)
+            predictions_mask_sig.append(outputs_mask_sig)
+            predictions_class_sig.append(outputs_class_sig)
             predictions_seed.append(outputs_seed)
 
         out = {
-            "pred_logits": torch.stack(predictions_class),
             "pred_masks": torch.stack(predictions_mask),
-            "pred_signatures": torch.stack(predictions_sig),
+            "pred_mask_signatures": torch.stack(predictions_mask_sig),
+            "pred_class_signatures": torch.stack(predictions_class_sig),
             "pred_seed_logits": torch.stack(predictions_seed),
         }
         return out
 
     def forward_prediction_heads(self, output, multi_scale_features, padding_masks=None):
         decoder_output = self.decoder_norm(output)
-        outputs_class = self.class_embed(decoder_output)
-        outputs_sig = self.sig_head(decoder_output)
+        outputs_mask_sig = self.mask_sig_head(decoder_output)
+        outputs_class_sig = self.class_sig_head(decoder_output)
         outputs_seed = self.seed_head(decoder_output).squeeze(-1)
 
         attn_biases = []
@@ -305,4 +308,4 @@ class LatentTransformerDecoder(nn.Module):
             )
             attn_biases.append(attn_bias)
 
-        return outputs_class, mask_embed, outputs_sig, outputs_seed, attn_biases
+        return mask_embed, outputs_mask_sig, outputs_class_sig, outputs_seed, attn_biases

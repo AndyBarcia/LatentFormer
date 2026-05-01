@@ -15,6 +15,13 @@ from detectron2.structures import BitMasks, Boxes, Instances
 __all__ = ["COCOPanopticNewBaselineDatasetMapper"]
 
 
+def build_semantic_from_panoptic(pan_seg_gt, segments_info, ignore_label=255):
+    sem_seg_gt = np.full(pan_seg_gt.shape, ignore_label, dtype=np.int64)
+    for segment_info in segments_info:
+        sem_seg_gt[pan_seg_gt == segment_info["id"]] = segment_info["category_id"]
+    return sem_seg_gt
+
+
 def build_transform_gen(cfg, is_train):
     """
     Create a list of default :class:`Augmentation` from config.
@@ -149,6 +156,10 @@ class COCOPanopticNewBaselineDatasetMapper:
             from panopticapi.utils import rgb2id
 
             pan_seg_gt = rgb2id(pan_seg_gt)
+            dataset_dict["sem_seg"] = torch.as_tensor(
+                build_semantic_from_panoptic(pan_seg_gt, segments_info),
+                dtype=torch.long,
+            )
 
             instances = Instances(image_shape)
             classes = []

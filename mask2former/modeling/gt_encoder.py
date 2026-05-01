@@ -8,7 +8,7 @@ from torch.amp import autocast
 
 
 class GroundTruthEncoder(nn.Module):
-    """Encode class, box, and mask-context cues for LatentFormer ground-truth regions."""
+    """Encode class-agnostic mask cues and learned class signatures for LatentFormer."""
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class GroundTruthEncoder(nn.Module):
         self.feature_levels = tuple(feature_levels or ())
         self.num_classes = num_classes
         self.background_label = num_classes
-        self.gt_cls_proj = nn.Embedding(num_classes + 1, sig_dim)
+        self.gt_class_proj = nn.Embedding(num_classes + 1, sig_dim)
         self.gt_bbox_proj = nn.Sequential(
             nn.Linear(4, hidden_dim),
             nn.ReLU(inplace=True),
@@ -90,15 +90,25 @@ class GroundTruthEncoder(nn.Module):
         self,
         features: Union[Dict[str, torch.Tensor], Sequence[torch.Tensor], torch.Tensor],
         masks: torch.Tensor,
-        labels: torch.Tensor,
         boxes: torch.Tensor,
         pad_mask: torch.Tensor,
     ) -> torch.Tensor:
         feature_maps = list(self._select_feature_maps(features))
         boxes = boxes.to(dtype=feature_maps[0].dtype)
 
-        labels = labels.clamp(min=0, max=self.gt_cls_proj.num_embeddings - 1)
-        gt_signature = self.gt_cls_proj(labels) + self.gt_bbox_proj(boxes)
+        gt_signature = self.gt_bbox_proj(boxes)
         for feature_map in feature_maps:
             gt_signature = gt_signature + self._encode_gt_mask_context(feature_map, masks, pad_mask)
         return gt_signature * pad_mask[:, :, None].to(dtype=gt_signature.dtype)
+
+    def class_signatures(self, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.clamp(min=0, max=self.gt_class_proj.num_embeddings - 1)
+        return self.gt_class_proj(labels)
+
+    def all_class_signatures(self) -> torch.Tensor:
+        class_ids = torch.arange(
+            self.num_classes,
+            device=self.gt_class_proj.weight.device,
+            dtype=torch.long,
+        )
+        return self.gt_class_proj(class_ids)

@@ -52,9 +52,9 @@ def soft_dice_loss(inputs, targets, valid_mask, num_masks, eps=1.0):
 class LatentCriterion(nn.Module):
     """Criterion for LatentFormer prototype predictions.
 
-    LatentFormer produces one class logit vector and one mask logit map per ground-truth
-    signature, plus a background signature. Prototype losses are already aligned with
-    targets; seed losses use Hungarian matching over query and ground-truth signatures.
+    LatentFormer produces object masks from mask signatures and semantic masks from
+    class signatures. Seed losses use Hungarian matching over the class-agnostic mask
+    signatures.
     """
 
     def __init__(
@@ -124,24 +124,21 @@ class LatentCriterion(nn.Module):
     def _resize_target_masks(self, masks, size):
         return F.interpolate(masks.float(), size=size, mode="area")
 
-    def loss_labels(self, outputs, targets, num_signatures):
-        del num_signatures
-        assert "proto_cls" in outputs
-        src_logits = outputs["proto_cls"].float()
-        target_classes = targets["labels"].to(device=src_logits.device)
-        pad_mask = targets["pad_mask"].to(device=src_logits.device)
-
-        loss_ce = F.cross_entropy(src_logits[pad_mask], target_classes[pad_mask])
-        return {"loss_ce": loss_ce}
-
-    def loss_masks(self, outputs, targets, num_signatures):
-        assert "proto_masks" in outputs
-        src_masks = outputs["proto_masks"]
+    def _soft_mask_losses(
+        self,
+        src_masks,
+        target_masks,
+        pad_mask,
+        num_masks,
+        *,
+        mask_loss_name,
+        dice_loss_name,
+    ):
         if not isinstance(src_masks, (list, tuple)):
             src_masks = [src_masks]
 
-        target_masks = targets["masks"].to(device=src_masks[0].device)
-        pad_mask = targets["pad_mask"].to(device=src_masks[0].device)
+        target_masks = target_masks.to(device=src_masks[0].device)
+        pad_mask = pad_mask.to(device=src_masks[0].device)
 
         losses = {}
         mask_ce_losses = []
@@ -156,9 +153,9 @@ class LatentCriterion(nn.Module):
             log_probs = F.log_softmax(src_masks_level, dim=1)
             mask_ce_loss = -(target_masks_level * log_probs).flatten(2).mean(dim=-1)
             mask_ce_loss = mask_ce_loss * pad_mask.to(dtype=mask_ce_loss.dtype)
-            mask_ce_losses.append(mask_ce_loss.sum() / num_signatures)
+            mask_ce_losses.append(mask_ce_loss.sum() / num_masks)
 
-        losses["loss_mask"] = torch.stack(mask_ce_losses).mean()
+        losses[mask_loss_name] = torch.stack(mask_ce_losses).mean()
 
         highest_res_masks = max(src_masks, key=lambda mask: mask.shape[-2] * mask.shape[-1])
         highest_res_masks = self._mask_invalid_slots(highest_res_masks.float(), pad_mask)
@@ -185,14 +182,48 @@ class LatentCriterion(nn.Module):
             point_coords,
             align_corners=False,
         )
-        losses["loss_dice"] = soft_dice_loss(point_logits, point_labels, pad_mask, num_signatures)
+        losses[dice_loss_name] = soft_dice_loss(point_logits, point_labels, pad_mask, num_masks)
 
         return losses
 
+    def loss_masks(self, outputs, targets, num_signatures):
+        assert "object_masks" in outputs
+        return self._soft_mask_losses(
+            outputs["object_masks"],
+            targets["masks"],
+            targets["pad_mask"],
+            num_signatures,
+            mask_loss_name="loss_mask",
+            dice_loss_name="loss_dice",
+        )
+
+    def loss_semantic_masks(self, outputs, targets, num_signatures):
+        del num_signatures
+        assert "semantic_masks" in outputs
+        if "semantic_masks" not in targets:
+            semantic_outputs = outputs["semantic_masks"]
+            zero_source = (
+                semantic_outputs[0] if isinstance(semantic_outputs, (list, tuple)) else semantic_outputs
+            )
+            zero = zero_source.sum() * 0.0
+            return {"loss_sem_mask": zero, "loss_sem_dice": zero}
+
+        semantic_targets = targets["semantic_masks"]
+        semantic_pad_mask = semantic_targets.flatten(2).sum(dim=-1) > 0
+        num_semantic_masks = self._get_global_normalizer(semantic_pad_mask.sum())
+        return self._soft_mask_losses(
+            outputs["semantic_masks"],
+            semantic_targets,
+            semantic_pad_mask,
+            num_semantic_masks,
+            mask_loss_name="loss_sem_mask",
+            dice_loss_name="loss_sem_dice",
+        )
+
     def loss_gt_sep(self, outputs, targets, num_signatures):
         del num_signatures
-        assert "gt_signatures" in outputs
-        gt_signatures = outputs["gt_signatures"]
+        assert "gt_mask_signatures" in outputs
+        gt_signatures = outputs["gt_mask_signatures"]
         pad_mask = targets["pad_mask"].to(device=gt_signatures.device)
         loss_sep = gt_signatures.sum() * 0.0
 
@@ -216,19 +247,19 @@ class LatentCriterion(nn.Module):
         return {"loss_gt_sep": loss_sep}
 
     def loss_seed(self, outputs, targets, num_signatures):
-        assert "pred_signatures" in outputs
+        assert "pred_mask_signatures" in outputs
         assert "pred_seed_logits" in outputs
-        assert "gt_signatures" in outputs
+        assert "gt_mask_signatures" in outputs
 
         q_sig_flat = self._flatten_query_features(
-            outputs["pred_signatures"],
-            "pred_signatures",
+            outputs["pred_mask_signatures"],
+            "pred_mask_signatures",
         )
         q_seed_logits_flat = self._flatten_query_logits(
             outputs["pred_seed_logits"],
             "pred_seed_logits",
         ).float()
-        gt_signatures = outputs["gt_signatures"].to(device=q_sig_flat.device)
+        gt_signatures = outputs["gt_mask_signatures"].to(device=q_sig_flat.device)
         pad_mask = targets["pad_mask"].to(device=q_sig_flat.device)
 
         matched_query_mask, matched_gt_indices = self.matcher(
@@ -271,7 +302,7 @@ class LatentCriterion(nn.Module):
             gt_pattern = query_to_gt_pattern.gather(
                 dim=2,
                 index=safe_matched_gt_indices[:, None, :].expand(-1, num_queries, -1),
-            ).detach()
+            ).detach() # Wait. Don't detach here? Maybe detach only gt_signatures?
 
             query_pattern = self._normalize_assignment_weights(query_pattern, dim=1)
             gt_pattern = self._normalize_assignment_weights(gt_pattern, dim=1)
@@ -295,8 +326,8 @@ class LatentCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, num_signatures):
         loss_map = {
-            "labels": self.loss_labels,
             "masks": self.loss_masks,
+            "semantic_masks": self.loss_semantic_masks,
             "gt_sep": self.loss_gt_sep,
             "seed": self.loss_seed,
         }
