@@ -77,18 +77,28 @@ class LatentAggregator(nn.Module):
         query_mask_embeddings: torch.Tensor,
         query_mask_signatures: torch.Tensor,
         query_class_signatures: torch.Tensor,
-        query_seed_logits: torch.Tensor,
+        query_mask_seed_logits: torch.Tensor,
+        query_class_seed_logits: torch.Tensor,
         seed_mask_signatures: torch.Tensor,
         *,
         class_signatures: torch.Tensor,
         mask_features,
         target_pad_mask: torch.Tensor = None,
+        class_pad_mask: torch.Tensor = None,
     ):
         q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
         q_mask_sig_flat = self._flatten_layer_queries(query_mask_signatures, "query_mask_signatures")
         q_class_sig_flat = self._flatten_layer_queries(query_class_signatures, "query_class_signatures")
-        q_seed_logits_flat = self._flatten_layer_logits(query_seed_logits, "query_seed_logits")
-        non_seed_gate = 1.0 - q_seed_logits_flat.float().sigmoid()
+        q_mask_seed_logits_flat = self._flatten_layer_logits(
+            query_mask_seed_logits,
+            "query_mask_seed_logits",
+        )
+        q_class_seed_logits_flat = self._flatten_layer_logits(
+            query_class_seed_logits,
+            "query_class_seed_logits",
+        )
+        non_mask_seed_gate = 1.0 - q_mask_seed_logits_flat.float().sigmoid()
+        class_seed_gate = q_class_seed_logits_flat.float().sigmoid()
 
         object_sim = pairwise_similarity(
             q_mask_sig_flat,
@@ -99,7 +109,7 @@ class LatentAggregator(nn.Module):
             similarity=object_sim,
             valid_mask=target_pad_mask,
         )
-        object_weights_flat = object_weights_flat * non_seed_gate.to(
+        object_weights_flat = object_weights_flat * non_mask_seed_gate.to(
             dtype=object_weights_flat.dtype
         ).unsqueeze(-1)
         object_norm_w = normalize_assignment_weights(object_weights_flat)
@@ -110,18 +120,45 @@ class LatentAggregator(nn.Module):
         ]
 
         class_signatures = class_signatures.to(device=q_class_sig_flat.device, dtype=q_class_sig_flat.dtype)
-        class_signatures = class_signatures.unsqueeze(0).expand(q_class_sig_flat.shape[0], -1, -1)
+        if class_signatures.dim() == 2:
+            class_signatures = class_signatures.unsqueeze(0).expand(q_class_sig_flat.shape[0], -1, -1)
+        elif class_signatures.dim() != 3:
+            raise ValueError(
+                f"class_signatures must be shaped [C,D] or [B,C,D], got {class_signatures.shape}."
+            )
+        if class_pad_mask is None:
+            class_pad_mask = torch.ones(
+                class_signatures.shape[:2],
+                dtype=torch.bool,
+                device=q_class_sig_flat.device,
+            )
+        else:
+            class_pad_mask = class_pad_mask.to(device=q_class_sig_flat.device)
         semantic_sim = pairwise_similarity(
             q_class_sig_flat,
             class_signatures,
             metric=self.aggregation_similarity_metric,
         )
+        semantic_weights = assignment_weights_from_similarity(
+            similarity=semantic_sim,
+            valid_mask=class_pad_mask,
+        )
+        semantic_weights = semantic_weights * class_seed_gate.to(
+            dtype=semantic_weights.dtype
+        ).unsqueeze(-1)
         semantic_weights = normalize_assignment_weights(
-            assignment_weights_from_similarity(similarity=semantic_sim)
+            semantic_weights
         )
         semantic_mask_emb = aggregate_with_weights(semantic_weights, q_mask_emb_flat)
         semantic_masks = [
             torch.einsum("bsc,bchw->bshw", semantic_mask_emb, feature) for feature in mask_features
+        ]
+        semantic_mask_emb = semantic_mask_emb * class_pad_mask[:, :, None].to(
+            dtype=semantic_mask_emb.dtype
+        )
+        semantic_masks = [
+            masks * class_pad_mask[:, :, None, None].to(dtype=masks.dtype)
+            for masks in semantic_masks
         ]
 
         if target_pad_mask is not None:
@@ -208,10 +245,15 @@ class LatentFormer(nn.Module):
             "loss_sem_mask": mask_weight,
             "loss_sem_dice": dice_weight,
             "loss_gt_sep": gt_sep_weight,
+            "loss_class_gt_sep": gt_sep_weight,
             "loss_seed": seed_weight,
             "loss_seed_sig": seed_sig_weight,
             "loss_seed_weight": seed_weight_pattern_weight,
             "loss_seed_cluster_pr": seed_cluster_pr_weight,
+            "loss_class_seed": seed_weight,
+            "loss_class_seed_sig": seed_sig_weight,
+            "loss_class_seed_weight": seed_weight_pattern_weight,
+            "loss_class_seed_cluster_pr": seed_cluster_pr_weight,
         }
         eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
         seed_selection_modules = build_seed_selection_modules(
@@ -304,11 +346,13 @@ class LatentFormer(nn.Module):
                 outputs["pred_masks"],
                 outputs["pred_mask_signatures"],
                 outputs["pred_class_signatures"],
-                outputs["pred_seed_logits"],
+                outputs["pred_mask_seed_logits"],
+                outputs["pred_class_seed_logits"],
                 outputs["gt_mask_signatures"],
-                class_signatures=outputs["class_signatures"],
+                class_signatures=outputs["gt_semantic_class_signatures"],
                 mask_features=outputs["mask_features"],
                 target_pad_mask=targets["pad_mask"],
+                class_pad_mask=targets["semantic_pad_mask"],
             )
 
             outputs["object_masks"] = object_masks
@@ -358,6 +402,12 @@ class LatentFormer(nn.Module):
             targets["pad_mask"],
         )
         outputs["gt_class_signatures"] = self.gt_encoder.class_signatures(targets["labels"])
+        if "semantic_labels" in targets:
+            semantic_class_signatures = self.gt_encoder.class_signatures(targets["semantic_labels"])
+            outputs["gt_semantic_class_signatures"] = (
+                semantic_class_signatures
+                * targets["semantic_pad_mask"][:, :, None].to(dtype=semantic_class_signatures.dtype)
+            )
         outputs["class_signatures"] = self.gt_encoder.all_class_signatures()
         return targets
 
@@ -368,9 +418,22 @@ class LatentFormer(nn.Module):
             gt_pad_mask = targets["pad_mask"] if targets is not None else None
             seed_signatures, seed_pad_mask, seed_scores = seed_selection(
                 outputs["pred_mask_signatures"],
-                outputs["pred_seed_logits"],
+                outputs["pred_mask_seed_logits"],
                 gt_signatures=gt_signatures,
                 gt_pad_mask=gt_pad_mask,
+            )
+            gt_class_signatures = outputs.get("gt_semantic_class_signatures")
+            gt_class_pad_mask = targets.get("semantic_pad_mask") if targets is not None else None
+            class_seed_signatures, class_seed_pad_mask, class_seed_scores = seed_selection(
+                outputs["pred_class_signatures"],
+                outputs["pred_class_seed_logits"],
+                gt_signatures=gt_class_signatures,
+                gt_pad_mask=gt_class_pad_mask,
+            )
+            class_seed_labels = self.class_labels_from_signatures(
+                class_seed_signatures,
+                class_seed_pad_mask,
+                outputs["class_signatures"],
             )
             mode_results[mode] = self._inference_with_seeds(
                 outputs,
@@ -380,6 +443,10 @@ class LatentFormer(nn.Module):
                 seed_signatures,
                 seed_pad_mask,
                 seed_scores,
+                class_seed_signatures,
+                class_seed_pad_mask,
+                class_seed_labels,
+                class_seed_scores,
                 targets=targets,
             )
 
@@ -396,17 +463,23 @@ class LatentFormer(nn.Module):
         seed_signatures,
         seed_pad_mask,
         seed_scores,
+        class_seed_signatures,
+        class_seed_pad_mask,
+        class_seed_labels,
+        class_seed_scores,
         targets=None,
     ):
         object_masks, semantic_masks, _, _ = self.aggregator(
             outputs["pred_masks"],
             outputs["pred_mask_signatures"],
             outputs["pred_class_signatures"],
-            outputs["pred_seed_logits"],
+            outputs["pred_mask_seed_logits"],
+            outputs["pred_class_seed_logits"],
             seed_signatures,
-            class_signatures=outputs["class_signatures"],
+            class_signatures=class_seed_signatures,
             mask_features=outputs["mask_features"],
             target_pad_mask=seed_pad_mask,
+            class_pad_mask=class_seed_pad_mask,
         )
 
         mask_pred_results = max(object_masks, key=lambda masks: masks.shape[-2] * masks.shape[-1])
@@ -439,8 +512,13 @@ class LatentFormer(nn.Module):
         )
         semantic_pred_results = semantic_pred_results.to(mask_pred_results)
         spatial_valid_mask = self._spatial_valid_mask(output_sizes, mask_pred_results)
-        object_class_scores = self.batched_object_class_scores(
+        semantic_prob_results = retry_if_cuda_oom(self.batched_semantic_inference)(
             semantic_pred_results,
+            class_seed_pad_mask,
+            class_seed_labels,
+        )
+        object_class_scores = self.batched_object_class_scores(
+            semantic_prob_results,
             mask_pred_results,
             seed_pad_mask,
             spatial_valid_mask,
@@ -451,9 +529,7 @@ class LatentFormer(nn.Module):
         panoptic_results = None
         instance_results = None
         if self.semantic_on:
-            sem_seg_results = retry_if_cuda_oom(self.batched_semantic_inference)(
-                semantic_pred_results,
-            )
+            sem_seg_results = semantic_prob_results
             sem_seg_results = sem_seg_results * spatial_valid_mask[:, None].to(dtype=sem_seg_results.dtype)
         if self.panoptic_on:
             panoptic_results = retry_if_cuda_oom(self.batched_panoptic_inference)(
@@ -476,8 +552,8 @@ class LatentFormer(nn.Module):
                 "pred_mask_signatures",
             )
             query_seed_scores = self._flatten_layer_logits(
-                outputs["pred_seed_logits"],
-                "pred_seed_logits",
+                outputs["pred_mask_seed_logits"],
+                "pred_mask_seed_logits",
             ).sigmoid()
         else:
             query_signatures = None
@@ -577,8 +653,43 @@ class LatentFormer(nn.Module):
         mask_logits = mask_pred.masked_fill(~seed_pad_mask[:, :, None, None], torch.finfo(mask_pred.dtype).min)
         return F.softmax(mask_logits, dim=1)
 
-    def batched_semantic_inference(self, semantic_pred):
-        return F.softmax(semantic_pred, dim=1)
+    def class_labels_from_signatures(self, class_seed_signatures, class_seed_pad_mask, all_class_signatures):
+        all_class_signatures = all_class_signatures.to(
+            device=class_seed_signatures.device,
+            dtype=class_seed_signatures.dtype,
+        )
+        all_class_signatures = all_class_signatures.unsqueeze(0).expand(
+            class_seed_signatures.shape[0],
+            -1,
+            -1,
+        )
+        similarity = pairwise_similarity(
+            class_seed_signatures,
+            all_class_signatures,
+            metric=self.aggregator.aggregation_similarity_metric,
+        )
+        labels = similarity.argmax(dim=-1)
+        return labels.masked_fill(~class_seed_pad_mask, 0)
+
+    def batched_semantic_inference(self, semantic_pred, class_seed_pad_mask, class_seed_labels):
+        batch_size, _, height, width = semantic_pred.shape
+        full_semantic = semantic_pred.new_zeros(
+            (batch_size, self.sem_seg_head.num_classes, height, width)
+        )
+        if semantic_pred.shape[1] == 0:
+            return full_semantic
+
+        seed_probs = F.softmax(
+            semantic_pred.masked_fill(
+                ~class_seed_pad_mask[:, :, None, None],
+                torch.finfo(semantic_pred.dtype).min,
+            ),
+            dim=1,
+        )
+        seed_probs = seed_probs * class_seed_pad_mask[:, :, None, None].to(dtype=seed_probs.dtype)
+        scatter_labels = class_seed_labels[:, :, None, None].expand(-1, -1, height, width)
+        full_semantic.scatter_add_(1, scatter_labels, seed_probs)
+        return full_semantic
 
     def batched_object_class_scores(
         self,
@@ -590,7 +701,7 @@ class LatentFormer(nn.Module):
         batch_size, num_seeds = mask_pred.shape[:2]
         if num_seeds == 0:
             return mask_pred.new_zeros((batch_size, 0, self.sem_seg_head.num_classes))
-        class_probs = F.softmax(semantic_pred, dim=1)
+        class_probs = semantic_pred
         mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
         mask_probs = mask_probs * spatial_valid_mask[:, None].to(dtype=mask_probs.dtype)
         denom = mask_probs.flatten(2).sum(dim=-1).clamp_min(1e-6)
@@ -793,9 +904,9 @@ class LatentFormer(nn.Module):
             pad_mask[idx, :num_instances] = True
 
         result = {"masks": masks, "labels": labels, "boxes": boxes, "pad_mask": pad_mask}
-        semantic_masks = self.prepare_semantic_targets(batched_inputs, targets, images)
-        if semantic_masks is not None:
-            result["semantic_masks"] = semantic_masks
+        semantic_targets = self.prepare_semantic_targets(batched_inputs, targets, images)
+        if semantic_targets is not None:
+            result.update(semantic_targets)
         return result
 
     def prepare_semantic_targets(self, batched_inputs, targets, images):
@@ -803,14 +914,12 @@ class LatentFormer(nn.Module):
             return None
 
         h_pad, w_pad = images.tensor.shape[-2:]
-        semantic_masks = torch.zeros(
-            (len(batched_inputs), self.sem_seg_head.num_classes, h_pad, w_pad),
-            dtype=images.tensor.dtype,
-            device=self.device,
-        )
+        per_image_masks = []
+        per_image_labels = []
         has_semantic_gt = False
 
         for idx, input_per_image in enumerate(batched_inputs):
+            class_to_mask = {}
             if "sem_seg" in input_per_image:
                 sem_seg = input_per_image["sem_seg"].to(device=self.device)
                 sem_h = min(sem_seg.shape[-2], h_pad)
@@ -818,27 +927,75 @@ class LatentFormer(nn.Module):
                 sem_seg = sem_seg[:sem_h, :sem_w]
                 valid = (sem_seg >= 0) & (sem_seg < self.sem_seg_head.num_classes)
                 if valid.any():
-                    class_ids = sem_seg[valid].long()
-                    rows, cols = valid.nonzero(as_tuple=True)
-                    semantic_masks[idx, class_ids, rows, cols] = 1.0
+                    for class_id in sem_seg[valid].unique().long().tolist():
+                        mask = torch.zeros(
+                            (h_pad, w_pad),
+                            dtype=images.tensor.dtype,
+                            device=self.device,
+                        )
+                        mask[:sem_h, :sem_w] = (sem_seg == class_id).to(dtype=mask.dtype)
+                        class_to_mask[int(class_id)] = mask
                     has_semantic_gt = True
-                continue
+            else:
+                targets_per_image = targets[idx]
+                if len(targets_per_image.gt_classes) > 0:
+                    gt_masks = targets_per_image.gt_masks
+                    if hasattr(gt_masks, "tensor"):
+                        gt_masks = gt_masks.tensor
+                    gt_masks = gt_masks.to(device=self.device, dtype=images.tensor.dtype)
+                    for class_id, mask in zip(targets_per_image.gt_classes.tolist(), gt_masks):
+                        if 0 <= class_id < self.sem_seg_head.num_classes:
+                            class_mask = class_to_mask.setdefault(
+                                int(class_id),
+                                torch.zeros(
+                                    (h_pad, w_pad),
+                                    dtype=images.tensor.dtype,
+                                    device=self.device,
+                                ),
+                            )
+                            class_mask[: mask.shape[-2], : mask.shape[-1]] = torch.maximum(
+                                class_mask[: mask.shape[-2], : mask.shape[-1]],
+                                mask,
+                            )
+                            has_semantic_gt = True
 
-            targets_per_image = targets[idx]
-            if len(targets_per_image.gt_classes) == 0:
-                continue
-            gt_masks = targets_per_image.gt_masks
-            if hasattr(gt_masks, "tensor"):
-                gt_masks = gt_masks.tensor
-            gt_masks = gt_masks.to(device=self.device, dtype=semantic_masks.dtype)
-            for class_id, mask in zip(targets_per_image.gt_classes.tolist(), gt_masks):
-                if 0 <= class_id < self.sem_seg_head.num_classes:
-                    semantic_masks[idx, class_id, : mask.shape[-2], : mask.shape[-1]] = torch.maximum(
-                        semantic_masks[idx, class_id, : mask.shape[-2], : mask.shape[-1]],
-                        mask,
-                    )
-                    has_semantic_gt = True
+            labels = sorted(class_to_mask)
+            if labels:
+                per_image_labels.append(torch.tensor(labels, dtype=torch.long, device=self.device))
+                per_image_masks.append(torch.stack([class_to_mask[class_id] for class_id in labels]))
+            else:
+                per_image_labels.append(torch.zeros((0,), dtype=torch.long, device=self.device))
+                per_image_masks.append(torch.zeros((0, h_pad, w_pad), dtype=images.tensor.dtype, device=self.device))
 
         if not has_semantic_gt:
             return None
-        return semantic_masks
+
+        max_classes = max((labels.numel() for labels in per_image_labels), default=0)
+        semantic_masks = torch.zeros(
+            (len(batched_inputs), max_classes, h_pad, w_pad),
+            dtype=images.tensor.dtype,
+            device=self.device,
+        )
+        semantic_labels = torch.zeros(
+            (len(batched_inputs), max_classes),
+            dtype=torch.long,
+            device=self.device,
+        )
+        semantic_pad_mask = torch.zeros(
+            (len(batched_inputs), max_classes),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        for idx, (labels, masks) in enumerate(zip(per_image_labels, per_image_masks)):
+            num_classes = labels.numel()
+            if num_classes == 0:
+                continue
+            semantic_labels[idx, :num_classes] = labels
+            semantic_masks[idx, :num_classes] = masks
+            semantic_pad_mask[idx, :num_classes] = True
+
+        return {
+            "semantic_masks": semantic_masks,
+            "semantic_labels": semantic_labels,
+            "semantic_pad_mask": semantic_pad_mask,
+        }

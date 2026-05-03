@@ -209,11 +209,7 @@ class LatentCriterion(nn.Module):
             return {"loss_sem_mask": zero, "loss_sem_dice": zero}
 
         semantic_targets = targets["semantic_masks"]
-        semantic_pad_mask = torch.ones(
-            semantic_targets.shape[:2],
-            dtype=torch.bool,
-            device=semantic_targets.device,
-        )
+        semantic_pad_mask = targets["semantic_pad_mask"].to(device=semantic_targets.device)
         num_semantic_masks = self._get_global_normalizer(semantic_pad_mask.sum())
         return self._soft_mask_losses(
             outputs["semantic_masks"],
@@ -224,16 +220,13 @@ class LatentCriterion(nn.Module):
             dice_loss_name="loss_sem_dice",
         )
 
-    def loss_gt_sep(self, outputs, targets, num_signatures):
-        del num_signatures
-        assert "gt_mask_signatures" in outputs
-        gt_signatures = outputs["gt_mask_signatures"]
-        pad_mask = targets["pad_mask"].to(device=gt_signatures.device)
+    def _gt_sep_loss(self, gt_signatures, pad_mask, loss_name):
+        pad_mask = pad_mask.to(device=gt_signatures.device)
         loss_sep = gt_signatures.sum() * 0.0
 
         num_gt = pad_mask.shape[1]
         if num_gt <= 1:
-            return {"loss_gt_sep": loss_sep}
+            return {loss_name: loss_sep}
 
         gt_sim = pairwise_similarity(
             gt_signatures,
@@ -248,23 +241,44 @@ class LatentCriterion(nn.Module):
             valid_pair_count = self._get_global_normalizer(off_diag_mask.sum())
             loss_sep = F.relu(gt_sim[off_diag_mask]).pow(2).sum() / valid_pair_count
 
-        return {"loss_gt_sep": loss_sep}
+        return {loss_name: loss_sep}
 
-    def loss_seed(self, outputs, targets, num_signatures):
-        assert "pred_mask_signatures" in outputs
-        assert "pred_seed_logits" in outputs
+    def loss_gt_sep(self, outputs, targets, num_signatures):
+        del num_signatures
         assert "gt_mask_signatures" in outputs
-
-        q_sig_flat = self._flatten_query_features(
-            outputs["pred_mask_signatures"],
-            "pred_mask_signatures",
+        losses = self._gt_sep_loss(
+            outputs["gt_mask_signatures"],
+            targets["pad_mask"],
+            "loss_gt_sep",
         )
+        if "gt_semantic_class_signatures" in outputs and "semantic_pad_mask" in targets:
+            losses.update(
+                self._gt_sep_loss(
+                    outputs["gt_semantic_class_signatures"],
+                    targets["semantic_pad_mask"],
+                    "loss_class_gt_sep",
+                )
+            )
+        return losses
+
+    def _signature_seed_loss(
+        self,
+        *,
+        query_signatures,
+        query_seed_logits,
+        target_signatures,
+        target_pad_mask,
+        num_signatures,
+        prefix,
+        clustering_seed_selection,
+    ):
+        q_sig_flat = self._flatten_query_features(query_signatures, f"pred_{prefix}_signatures")
         q_seed_logits_flat = self._flatten_query_logits(
-            outputs["pred_seed_logits"],
-            "pred_seed_logits",
+            query_seed_logits,
+            f"pred_{prefix}_seed_logits",
         ).float()
-        gt_signatures = outputs["gt_mask_signatures"].to(device=q_sig_flat.device)
-        pad_mask = targets["pad_mask"].to(device=q_sig_flat.device)
+        gt_signatures = target_signatures.to(device=q_sig_flat.device)
+        pad_mask = target_pad_mask.to(device=q_sig_flat.device)
 
         matched_query_mask, matched_gt_indices = self.matcher(
             q_sig_flat,
@@ -313,7 +327,6 @@ class LatentCriterion(nn.Module):
             pattern_loss = (query_pattern - gt_pattern).abs().sum(dim=1)
             loss_seed_weight = pattern_loss[matched_query_mask].sum() / num_signatures
 
-        clustering_seed_selection = outputs["clustering_seed_selection"]
         loss_seed_cluster_pr = clustering_seed_selection.threshold_pr_loss(
             query_signatures=q_sig_flat,
             query_seed_logits=q_seed_logits_flat,
@@ -322,11 +335,46 @@ class LatentCriterion(nn.Module):
         )
 
         return {
-            "loss_seed": loss_seed,
-            "loss_seed_sig": loss_seed_sig,
-            "loss_seed_weight": loss_seed_weight,
-            "loss_seed_cluster_pr": loss_seed_cluster_pr,
+            f"loss_{prefix}_seed": loss_seed,
+            f"loss_{prefix}_seed_sig": loss_seed_sig,
+            f"loss_{prefix}_seed_weight": loss_seed_weight,
+            f"loss_{prefix}_seed_cluster_pr": loss_seed_cluster_pr,
         }
+
+    def loss_seed(self, outputs, targets, num_signatures):
+        assert "pred_mask_signatures" in outputs
+        assert "pred_mask_seed_logits" in outputs
+        assert "gt_mask_signatures" in outputs
+
+        losses = self._signature_seed_loss(
+            query_signatures=outputs["pred_mask_signatures"],
+            query_seed_logits=outputs["pred_mask_seed_logits"],
+            target_signatures=outputs["gt_mask_signatures"],
+            target_pad_mask=targets["pad_mask"],
+            num_signatures=num_signatures,
+            prefix="mask",
+            clustering_seed_selection=outputs["clustering_seed_selection"],
+        )
+        losses["loss_seed"] = losses.pop("loss_mask_seed")
+        losses["loss_seed_sig"] = losses.pop("loss_mask_seed_sig")
+        losses["loss_seed_weight"] = losses.pop("loss_mask_seed_weight")
+        losses["loss_seed_cluster_pr"] = losses.pop("loss_mask_seed_cluster_pr")
+
+        if "gt_semantic_class_signatures" in outputs and "semantic_pad_mask" in targets:
+            num_class_signatures = self._get_global_normalizer(targets["semantic_pad_mask"].sum())
+            losses.update(
+                self._signature_seed_loss(
+                    query_signatures=outputs["pred_class_signatures"],
+                    query_seed_logits=outputs["pred_class_seed_logits"],
+                    target_signatures=outputs["gt_semantic_class_signatures"],
+                    target_pad_mask=targets["semantic_pad_mask"],
+                    num_signatures=num_class_signatures,
+                    prefix="class",
+                    clustering_seed_selection=outputs["clustering_seed_selection"],
+                )
+            )
+
+        return losses
 
     def get_loss(self, loss, outputs, targets, num_signatures):
         loss_map = {
