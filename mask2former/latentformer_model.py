@@ -86,8 +86,7 @@ class LatentAggregator(nn.Module):
         q_cls_flat = self._flatten_layer_queries(query_class_logits, "query_class_logits")
         q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
         q_sig_flat = self._flatten_layer_queries(query_signatures, "query_signatures")
-        q_seed_logits_flat = self._flatten_layer_logits(query_seed_logits, "query_seed_logits")
-        non_seed_gate = 1.0 - q_seed_logits_flat.float().sigmoid()
+        del query_seed_logits
 
         sim = pairwise_similarity(
             q_sig_flat,
@@ -98,7 +97,6 @@ class LatentAggregator(nn.Module):
             similarity=sim,
             valid_mask=target_pad_mask,
         )
-        weights_flat = weights_flat * non_seed_gate.to(dtype=weights_flat.dtype).unsqueeze(-1)
         norm_w = normalize_assignment_weights(weights_flat)
 
         proto_mask_emb = aggregate_with_weights(norm_w, q_mask_emb_flat)
@@ -195,6 +193,17 @@ class LatentFormer(nn.Module):
             "loss_seed_weight": seed_weight_pattern_weight,
             "loss_seed_cluster_pr": seed_cluster_pr_weight,
         }
+        aux_weight_dict = {}
+        for i in range(cfg.MODEL.LATENT_FORMER.DEC_LAYERS - 1):
+            aux_weight_dict.update(
+                {
+                    "loss_seed" + f"_{i}": seed_weight,
+                    "loss_seed_sig" + f"_{i}": seed_sig_weight,
+                    "loss_seed_weight" + f"_{i}": seed_weight_pattern_weight,
+                    "loss_seed_cluster_pr" + f"_{i}": seed_cluster_pr_weight,
+                }
+            )
+        weight_dict.update(aux_weight_dict)
         eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
         seed_selection_modules = build_seed_selection_modules(
             eval_modes=eval_modes,
@@ -284,7 +293,7 @@ class LatentFormer(nn.Module):
             proto_cls, proto_masks, proto_mask_emb = self.aggregator(
                 outputs["pred_logits"],
                 outputs["pred_masks"],
-                outputs["pred_signatures"],
+                outputs["component_signatures"],
                 outputs["pred_seed_logits"],
                 outputs["gt_signatures"],
                 mask_features=outputs["mask_features"],
@@ -341,12 +350,14 @@ class LatentFormer(nn.Module):
 
     def inference(self, outputs, batched_inputs, image_sizes, padded_image_size, targets=None):
         mode_results = {}
+        pred_signatures = self._final_query_layer(outputs["pred_signatures"])
+        pred_seed_logits = self._final_query_layer(outputs["pred_seed_logits"])
         for mode, seed_selection in self.seed_selection_modules.items():
             gt_signatures = outputs.get("gt_signatures")
             gt_pad_mask = targets["pad_mask"] if targets is not None else None
             seed_signatures, seed_pad_mask, seed_scores = seed_selection(
-                outputs["pred_signatures"],
-                outputs["pred_seed_logits"],
+                pred_signatures,
+                pred_seed_logits,
                 gt_signatures=gt_signatures,
                 gt_pad_mask=gt_pad_mask,
             )
@@ -379,7 +390,7 @@ class LatentFormer(nn.Module):
         proto_cls, proto_masks, _ = self.aggregator(
             outputs["pred_logits"],
             outputs["pred_masks"],
-            outputs["pred_signatures"],
+            outputs["component_signatures"],
             outputs["pred_seed_logits"],
             seed_signatures,
             mask_features=outputs["mask_features"],
@@ -430,11 +441,11 @@ class LatentFormer(nn.Module):
 
         if self.signature_on and targets is not None and "gt_signatures" in outputs:
             query_signatures = LatentAggregator._flatten_layer_queries(
-                outputs["pred_signatures"],
+                self._final_query_layer(outputs["pred_signatures"]),
                 "pred_signatures",
             )
             query_seed_scores = self._flatten_layer_logits(
-                outputs["pred_seed_logits"],
+                self._final_query_layer(outputs["pred_seed_logits"]),
                 "pred_seed_logits",
             ).sigmoid()
         else:
@@ -481,6 +492,12 @@ class LatentFormer(nn.Module):
                 }
 
         return processed_results
+
+    @staticmethod
+    def _final_query_layer(values: torch.Tensor) -> torch.Tensor:
+        if values.dim() in (3, 4):
+            return values[-1]
+        return values
 
     @staticmethod
     def _flatten_layer_logits(values: torch.Tensor, name: str) -> torch.Tensor:

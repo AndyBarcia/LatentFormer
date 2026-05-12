@@ -220,14 +220,38 @@ class LatentCriterion(nn.Module):
         assert "pred_seed_logits" in outputs
         assert "gt_signatures" in outputs
 
-        q_sig_flat = self._flatten_query_features(
-            outputs["pred_signatures"],
-            "pred_signatures",
+        pred_signatures = outputs["pred_signatures"]
+        pred_seed_logits = outputs["pred_seed_logits"]
+        if pred_signatures.dim() == 4:
+            losses = self._loss_seed_single(
+                pred_signatures[-1],
+                pred_seed_logits[-1],
+                outputs,
+                targets,
+                num_signatures,
+            )
+            for i in range(pred_signatures.shape[0] - 1):
+                aux_losses = self._loss_seed_single(
+                    pred_signatures[i],
+                    pred_seed_logits[i],
+                    outputs,
+                    targets,
+                    num_signatures,
+                )
+                losses.update({f"{key}_{i}": value for key, value in aux_losses.items()})
+            return losses
+
+        return self._loss_seed_single(
+            pred_signatures,
+            pred_seed_logits,
+            outputs,
+            targets,
+            num_signatures,
         )
-        q_seed_logits_flat = self._flatten_query_logits(
-            outputs["pred_seed_logits"],
-            "pred_seed_logits",
-        ).float()
+
+    def _loss_seed_single(self, pred_signatures, pred_seed_logits, outputs, targets, num_signatures):
+        q_sig_flat = self._flatten_query_features(pred_signatures, "pred_signatures")
+        q_seed_logits_flat = self._flatten_query_logits(pred_seed_logits, "pred_seed_logits").float()
         gt_signatures = outputs["gt_signatures"].to(device=q_sig_flat.device)
         pad_mask = targets["pad_mask"].to(device=q_sig_flat.device)
 

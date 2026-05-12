@@ -89,6 +89,109 @@ class AttnResidualDecoder(nn.Module):
         return output.transpose(0, 1)
 
 
+class ObjectQueryDecoder(nn.Module):
+    """Decode object hypotheses by attending over latent component query states."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        sig_dim: int,
+        num_queries: int,
+        num_layers: int,
+        nheads: int,
+        dropout: float,
+        dim_feedforward: int,
+        pre_norm: bool,
+        num_memory_layers: int,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.query_feat = nn.Embedding(num_queries, hidden_dim)
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.memory_layer_embed = nn.Embedding(num_memory_layers, hidden_dim)
+
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(
+                nn.ModuleDict(
+                    {
+                        "self_attn": SelfAttentionLayer(
+                            d_model=hidden_dim,
+                            nhead=nheads,
+                            dropout=dropout,
+                            normalize_before=pre_norm,
+                        ),
+                        "cross_attn": CrossAttentionLayer(
+                            d_model=hidden_dim,
+                            nhead=nheads,
+                            dropout=dropout,
+                            normalize_before=pre_norm,
+                        ),
+                        "ffn": FFNLayer(
+                            d_model=hidden_dim,
+                            dim_feedforward=dim_feedforward,
+                            dropout=dropout,
+                            normalize_before=pre_norm,
+                        ),
+                    }
+                )
+            )
+
+        self.decoder_norm = nn.LayerNorm(hidden_dim)
+        self.sig_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, sig_dim),
+        )
+        self.seed_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def _prepare_memory(self, component_history: List[Tensor]) -> Tensor:
+        memory = []
+        for layer_idx, states in enumerate(component_history):
+            memory.append(states + self.memory_layer_embed.weight[layer_idx].view(1, 1, -1))
+        return torch.cat(memory, dim=1).transpose(0, 1)
+
+    def _prediction_heads(self, output: Tensor):
+        output = self.decoder_norm(output)
+        return self.sig_head(output), self.seed_head(output).squeeze(-1)
+
+    def forward(self, component_history: List[Tensor]):
+        memory = self._prepare_memory(component_history)
+        bs = component_history[0].shape[0]
+        query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+
+        predictions_sig = []
+        predictions_seed = []
+        for layer in self.layers:
+            output = layer["self_attn"](
+                output,
+                tgt_mask=None,
+                tgt_key_padding_mask=None,
+                query_pos=query_pos,
+            )
+            output = layer["cross_attn"](
+                output,
+                memory,
+                memory_mask=None,
+                memory_key_padding_mask=None,
+                pos=None,
+                query_pos=query_pos,
+            )
+            output = layer["ffn"](output)
+
+            outputs_sig, outputs_seed = self._prediction_heads(output.transpose(0, 1))
+            predictions_sig.append(outputs_sig)
+            predictions_seed.append(outputs_seed)
+
+        return torch.stack(predictions_sig), torch.stack(predictions_seed)
+
+
 @TRANSFORMER_DECODER_REGISTRY.register()
 class LatentTransformerDecoder(nn.Module):
     """Multi-scale LatentFormer transformer decoder."""
@@ -177,10 +280,16 @@ class LatentTransformerDecoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, sig_dim),
         )
-        self.seed_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
+        self.object_decoder = ObjectQueryDecoder(
+            hidden_dim=hidden_dim,
+            sig_dim=sig_dim,
+            num_queries=num_queries,
+            num_layers=dec_layers,
+            nheads=nheads,
+            dropout=dropout,
+            dim_feedforward=dim_feedforward,
+            pre_norm=pre_norm,
+            num_memory_layers=dec_layers + 1,
         )
 
     @classmethod
@@ -227,8 +336,7 @@ class LatentTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
         predictions_sig = []
-        predictions_seed = []
-        _, _, _, _, attn_biases = self.forward_prediction_heads(
+        _, _, _, attn_biases = self.forward_prediction_heads(
             output, multi_scale_features, padding_masks
         )
 
@@ -256,19 +364,21 @@ class LatentTransformerDecoder(nn.Module):
             )
             history.append(output)
 
-            outputs_class, outputs_mask, outputs_sig, outputs_seed, attn_biases = (
+            outputs_class, outputs_mask, outputs_sig, attn_biases = (
                 self.forward_prediction_heads(output, multi_scale_features, padding_masks)
             )
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_sig.append(outputs_sig)
-            predictions_seed.append(outputs_seed)
+
+        pred_signatures, pred_seed_logits = self.object_decoder(history)
 
         out = {
             "pred_logits": torch.stack(predictions_class),
             "pred_masks": torch.stack(predictions_mask),
-            "pred_signatures": torch.stack(predictions_sig),
-            "pred_seed_logits": torch.stack(predictions_seed),
+            "component_signatures": torch.stack(predictions_sig),
+            "pred_signatures": pred_signatures,
+            "pred_seed_logits": pred_seed_logits,
         }
         return out
 
@@ -276,7 +386,6 @@ class LatentTransformerDecoder(nn.Module):
         decoder_output = self.decoder_norm(output)
         outputs_class = self.class_embed(decoder_output)
         outputs_sig = self.sig_head(decoder_output)
-        outputs_seed = self.seed_head(decoder_output).squeeze(-1)
 
         attn_biases = []
         mask_embed = self.mask_embed(decoder_output)
@@ -305,4 +414,4 @@ class LatentTransformerDecoder(nn.Module):
             )
             attn_biases.append(attn_bias)
 
-        return outputs_class, mask_embed, outputs_sig, outputs_seed, attn_biases
+        return outputs_class, mask_embed, outputs_sig, attn_biases
