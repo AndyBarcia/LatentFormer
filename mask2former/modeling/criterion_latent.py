@@ -237,6 +237,7 @@ class LatentCriterion(nn.Module):
                     outputs,
                     targets,
                     num_signatures,
+                    include_seed_cluster_pr=False,
                 )
                 losses.update({f"{key}_{i}": value for key, value in aux_losses.items()})
             return losses
@@ -249,7 +250,16 @@ class LatentCriterion(nn.Module):
             num_signatures,
         )
 
-    def _loss_seed_single(self, pred_signatures, pred_seed_logits, outputs, targets, num_signatures):
+    def _loss_seed_single(
+        self,
+        pred_signatures,
+        pred_seed_logits,
+        outputs,
+        targets,
+        num_signatures,
+        *,
+        include_seed_cluster_pr=True,
+    ):
         q_sig_flat = self._flatten_query_features(pred_signatures, "pred_signatures")
         q_seed_logits_flat = self._flatten_query_logits(pred_seed_logits, "pred_seed_logits").float()
         gt_signatures = outputs["gt_signatures"].to(device=q_sig_flat.device)
@@ -302,20 +312,20 @@ class LatentCriterion(nn.Module):
             pattern_loss = (query_pattern - gt_pattern).abs().sum(dim=1)
             loss_seed_weight = pattern_loss[matched_query_mask].sum() / num_signatures
 
-        clustering_seed_selection = outputs["clustering_seed_selection"]
-        loss_seed_cluster_pr = clustering_seed_selection.threshold_pr_loss(
-            query_signatures=q_sig_flat,
-            query_seed_logits=q_seed_logits_flat,
-            matched_query_mask=matched_query_mask,
-            matched_gt_indices=matched_gt_indices,
-        )
-
-        return {
+        losses = {
             "loss_seed": loss_seed,
             "loss_seed_sig": loss_seed_sig,
             "loss_seed_weight": loss_seed_weight,
-            "loss_seed_cluster_pr": loss_seed_cluster_pr,
         }
+        if include_seed_cluster_pr:
+            clustering_seed_selection = outputs["clustering_seed_selection"]
+            losses["loss_seed_cluster_pr"] = clustering_seed_selection.threshold_pr_loss(
+                query_signatures=q_sig_flat,
+                query_seed_logits=q_seed_logits_flat,
+                matched_query_mask=matched_query_mask,
+                matched_gt_indices=matched_gt_indices,
+            )
+        return losses
 
     def get_loss(self, loss, outputs, targets, num_signatures):
         loss_map = {

@@ -16,6 +16,7 @@ from .mask2former_transformer_decoder import (
 )
 from .maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 from .position_encoding import PositionEmbeddingSine
+from ..similarity import pairwise_similarity
 from ...utils.padding import nonempty_padding_mask, resize_padding_mask
 
 
@@ -104,9 +105,12 @@ class ObjectQueryDecoder(nn.Module):
         dim_feedforward: int,
         pre_norm: bool,
         num_memory_layers: int,
+        attention_similarity_metric: str,
     ):
         super().__init__()
         self.num_layers = num_layers
+        self.num_heads = nheads
+        self.attention_similarity_metric = attention_similarity_metric
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.memory_layer_embed = nn.Embedding(num_memory_layers, hidden_dim)
@@ -160,8 +164,27 @@ class ObjectQueryDecoder(nn.Module):
         output = self.decoder_norm(output)
         return self.sig_head(output), self.seed_head(output).squeeze(-1)
 
-    def forward(self, component_history: List[Tensor]):
+    @torch.no_grad()
+    def _signature_attention_mask(self, object_signatures: Tensor, memory_signatures: Tensor) -> Tensor:
+        similarity = pairwise_similarity(
+            object_signatures,
+            memory_signatures,
+            metric=self.attention_similarity_metric,
+            clamp=False,
+        )
+        attn_mask = (similarity <= 0).bool()
+        attn_mask = (
+            attn_mask.unsqueeze(1)
+            .repeat(1, self.num_heads, 1, 1)
+            .flatten(0, 1)
+            .detach()
+        )
+        attn_mask[torch.where(attn_mask.all(-1))] = False
+        return attn_mask
+
+    def forward(self, component_history: List[Tensor], component_signature_history: List[Tensor]):
         memory = self._prepare_memory(component_history)
+        memory_signatures = torch.cat(component_signature_history, dim=1)
         bs = component_history[0].shape[0]
         query_pos = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
@@ -175,10 +198,12 @@ class ObjectQueryDecoder(nn.Module):
                 tgt_key_padding_mask=None,
                 query_pos=query_pos,
             )
+            outputs_sig, _ = self._prediction_heads(output.transpose(0, 1))
+            attn_mask = self._signature_attention_mask(outputs_sig, memory_signatures)
             output = layer["cross_attn"](
                 output,
                 memory,
-                memory_mask=None,
+                memory_mask=attn_mask,
                 memory_key_padding_mask=None,
                 pos=None,
                 query_pos=query_pos,
@@ -213,6 +238,7 @@ class LatentTransformerDecoder(nn.Module):
         pre_norm: bool,
         num_feature_levels: int,
         enforce_input_project: bool,
+        aggregation_similarity_metric: str,
         use_attention_residuals: bool = True,
     ):
         super().__init__()
@@ -290,6 +316,7 @@ class LatentTransformerDecoder(nn.Module):
             dim_feedforward=dim_feedforward,
             pre_norm=pre_norm,
             num_memory_layers=dec_layers + 1,
+            attention_similarity_metric=aggregation_similarity_metric,
         )
 
     @classmethod
@@ -309,6 +336,7 @@ class LatentTransformerDecoder(nn.Module):
         ret["pre_norm"] = cfg.MODEL.LATENT_FORMER.PRE_NORM
         ret["num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.get("LATENT_FPN_NUM_LEVELS", 3)
         ret["enforce_input_project"] = cfg.MODEL.LATENT_FORMER.ENFORCE_INPUT_PROJ
+        ret["aggregation_similarity_metric"] = cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC
         return ret
 
     def forward(self, multi_scale_features, mask=None):
@@ -336,9 +364,10 @@ class LatentTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
         predictions_sig = []
-        _, _, _, attn_biases = self.forward_prediction_heads(
+        _, _, outputs_sig, attn_biases = self.forward_prediction_heads(
             output, multi_scale_features, padding_masks
         )
+        signature_history = [outputs_sig]
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -370,8 +399,9 @@ class LatentTransformerDecoder(nn.Module):
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_sig.append(outputs_sig)
+            signature_history.append(outputs_sig)
 
-        pred_signatures, pred_seed_logits = self.object_decoder(history)
+        pred_signatures, pred_seed_logits = self.object_decoder(history, signature_history)
 
         out = {
             "pred_logits": torch.stack(predictions_class),

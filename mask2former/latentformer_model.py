@@ -200,7 +200,6 @@ class LatentFormer(nn.Module):
                     "loss_seed" + f"_{i}": seed_weight,
                     "loss_seed_sig" + f"_{i}": seed_sig_weight,
                     "loss_seed_weight" + f"_{i}": seed_weight_pattern_weight,
-                    "loss_seed_cluster_pr" + f"_{i}": seed_cluster_pr_weight,
                 }
             )
         weight_dict.update(aux_weight_dict)
