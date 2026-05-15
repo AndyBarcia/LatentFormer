@@ -17,44 +17,39 @@ from .similarity import pairwise_similarity
 from ..utils.misc import is_dist_avail_and_initialized
 
 
-def calculate_entropy_uncertainty(logits):
+def calculate_sigmoid_uncertainty(logits):
     """
-    Estimate mask uncertainty from the entropy of the softmax distribution over latent signatures.
+    Estimate binary mask uncertainty for point sampling.
 
     Args:
-        logits (Tensor): A tensor of shape (N, S, ...), where S is the number of valid
-            ground-truth signatures, including the background signature.
+        logits (Tensor): A tensor of shape (N, 1, ...).
     Returns:
         Tensor: Uncertainty scores shaped (N, 1, ...); larger values are more uncertain.
     """
-    probs = logits.softmax(dim=1)
-    log_probs = F.log_softmax(logits, dim=1)
-    return -(probs * log_probs).sum(dim=1, keepdim=True)
+    return -torch.abs(logits)
 
 
-def soft_dice_loss(inputs, targets, valid_mask, num_masks, eps=1.0):
+def sigmoid_dice_loss(inputs, targets, num_masks, eps=1.0):
     """
-    Softmax DICE loss for mutually-exclusive latent masks.
+    Sigmoid DICE loss for independent latent masks.
 
     Args:
-        inputs: logits shaped [B, S, P].
-        targets: soft target distributions shaped [B, S, P].
-        valid_mask: bool tensor shaped [B, S] selecting real signatures.
+        inputs: logits shaped [N, P].
+        targets: binary target masks shaped [N, P].
     """
-    inputs = inputs.softmax(dim=1)
+    inputs = inputs.sigmoid()
     numerator = 2 * (inputs * targets).sum(dim=-1)
     denominator = inputs.sum(dim=-1) + targets.sum(dim=-1)
     loss = 1 - (numerator + eps) / (denominator + eps)
-    loss = loss * valid_mask.to(dtype=loss.dtype)
     return loss.sum() / num_masks
 
 
 class LatentCriterion(nn.Module):
     """Criterion for LatentFormer prototype predictions.
 
-    LatentFormer produces one class logit vector and one mask logit map per ground-truth
-    signature, plus a background signature. Prototype losses are already aligned with
-    targets; seed losses use Hungarian matching over query and ground-truth signatures.
+    LatentFormer produces one class logit vector and one independent mask logit map per
+    ground-truth signature. Prototype losses are already aligned with targets; seed
+    losses use Hungarian matching over query and ground-truth signatures.
     """
 
     def __init__(
@@ -89,17 +84,6 @@ class LatentCriterion(nn.Module):
         return torch.clamp(counts / get_world_size(), min=1).item()
 
     @staticmethod
-    def _mask_invalid_slots(logits, pad_mask):
-        mask_shape = (pad_mask.shape[0], pad_mask.shape[1]) + (1,) * (logits.dim() - 2)
-        return logits.masked_fill(~pad_mask.view(mask_shape), -1e4)
-
-    @staticmethod
-    def _normalize_target_masks(target_masks, pad_mask):
-        target_masks = target_masks * pad_mask[:, :, None, None].to(dtype=target_masks.dtype)
-        denom = target_masks.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        return target_masks / denom
-
-    @staticmethod
     def _flatten_query_features(values, name):
         if values.dim() == 3:
             return values
@@ -131,6 +115,9 @@ class LatentCriterion(nn.Module):
         target_classes = targets["labels"].to(device=src_logits.device)
         pad_mask = targets["pad_mask"].to(device=src_logits.device)
 
+        if not pad_mask.any():
+            return {"loss_ce": src_logits.sum() * 0.0}
+
         loss_ce = F.cross_entropy(src_logits[pad_mask], target_classes[pad_mask])
         return {"loss_ce": loss_ce}
 
@@ -146,46 +133,55 @@ class LatentCriterion(nn.Module):
         losses = {}
         mask_ce_losses = []
         for src_masks_level in src_masks:
-            src_masks_level = self._mask_invalid_slots(src_masks_level.float(), pad_mask)
+            src_masks_level = src_masks_level.float()
             target_masks_level = self._resize_target_masks(
                 target_masks,
                 src_masks_level.shape[-2:],
             ).to(dtype=src_masks_level.dtype)
-            target_masks_level = self._normalize_target_masks(target_masks_level, pad_mask)
 
-            log_probs = F.log_softmax(src_masks_level, dim=1)
-            mask_ce_loss = -(target_masks_level * log_probs).flatten(2).mean(dim=-1)
-            mask_ce_loss = mask_ce_loss * pad_mask.to(dtype=mask_ce_loss.dtype)
-            mask_ce_losses.append(mask_ce_loss.sum() / num_signatures)
+            if pad_mask.any():
+                mask_ce_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        src_masks_level[pad_mask],
+                        target_masks_level[pad_mask],
+                        reduction="mean",
+                    )
+                )
+            else:
+                mask_ce_losses.append(src_masks_level.sum() * 0.0)
 
         losses["loss_mask"] = torch.stack(mask_ce_losses).mean()
 
         highest_res_masks = max(src_masks, key=lambda mask: mask.shape[-2] * mask.shape[-1])
-        highest_res_masks = self._mask_invalid_slots(highest_res_masks.float(), pad_mask)
-        target_masks = self._normalize_target_masks(target_masks.float(), pad_mask)
+        highest_res_masks = highest_res_masks.float()
+
+        if not pad_mask.any():
+            losses["loss_dice"] = highest_res_masks.sum() * 0.0
+            return losses
+
+        valid_highest_res_masks = highest_res_masks[pad_mask][:, None]
+        valid_target_masks = target_masks.float()[pad_mask][:, None]
 
         with torch.no_grad():
             point_coords = get_uncertain_point_coords_with_randomness(
-                highest_res_masks,
-                lambda logits: calculate_entropy_uncertainty(logits),
+                valid_highest_res_masks,
+                lambda logits: calculate_sigmoid_uncertainty(logits),
                 self.num_points,
                 self.oversample_ratio,
                 self.importance_sample_ratio,
             )
             point_labels = point_sample(
-                target_masks,
+                valid_target_masks,
                 point_coords,
                 align_corners=False,
-            )
-            point_labels = point_labels * pad_mask[:, :, None].to(dtype=point_labels.dtype)
-            point_labels = point_labels / point_labels.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            ).squeeze(1)
 
         point_logits = point_sample(
-            highest_res_masks,
+            valid_highest_res_masks,
             point_coords,
             align_corners=False,
-        )
-        losses["loss_dice"] = soft_dice_loss(point_logits, point_labels, pad_mask, num_signatures)
+        ).squeeze(1)
+        losses["loss_dice"] = sigmoid_dice_loss(point_logits, point_labels, num_signatures)
 
         return losses
 

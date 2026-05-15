@@ -531,16 +531,16 @@ class LatentFormer(nn.Module):
             mask[idx, :height, :width] = True
         return mask
 
-    def _masked_seed_softmax(self, mask_pred, seed_pad_mask):
-        mask_logits = mask_pred.masked_fill(~seed_pad_mask[:, :, None, None], torch.finfo(mask_pred.dtype).min)
-        return F.softmax(mask_logits, dim=1)
+    def _masked_seed_sigmoid(self, mask_pred, seed_pad_mask):
+        mask_probs = mask_pred.sigmoid()
+        return mask_probs * seed_pad_mask[:, :, None, None].to(dtype=mask_probs.dtype)
 
     def batched_semantic_inference(self, mask_cls, mask_pred, seed_pad_mask):
         if mask_cls.shape[1] == 0:
             return mask_pred.new_zeros((mask_pred.shape[0], self.sem_seg_head.num_classes, *mask_pred.shape[-2:]))
         class_probs = F.softmax(mask_cls, dim=-1)[..., :-1]
         class_probs = class_probs * seed_pad_mask[:, :, None].to(dtype=class_probs.dtype)
-        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        mask_probs = self._masked_seed_sigmoid(mask_pred, seed_pad_mask)
         return torch.einsum("bqc,bqhw->bchw", class_probs, mask_probs)
 
     def batched_panoptic_inference(self, mask_cls, mask_pred, seed_pad_mask, spatial_valid_mask):
@@ -550,7 +550,7 @@ class LatentFormer(nn.Module):
             return [(empty.clone(), []) for _ in range(batch_size)]
 
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
-        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        mask_probs = self._masked_seed_sigmoid(mask_pred, seed_pad_mask)
         keep = (
             seed_pad_mask
             & labels.ne(self.sem_seg_head.num_classes)
@@ -620,7 +620,7 @@ class LatentFormer(nn.Module):
         scores_per_image, topk_indices = scores.flatten(1, 2).topk(k, dim=1, sorted=False)
         labels_per_image = topk_indices % self.sem_seg_head.num_classes
         seed_indices = topk_indices // self.sem_seg_head.num_classes
-        mask_probs = self._masked_seed_softmax(mask_pred, seed_pad_mask)
+        mask_probs = self._masked_seed_sigmoid(mask_pred, seed_pad_mask)
         selected_masks = mask_probs.gather(
             1,
             seed_indices[:, :, None, None].expand(-1, -1, height, width),
@@ -668,10 +668,9 @@ class LatentFormer(nn.Module):
 
     def prepare_gt_encoder_inputs(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
-        background_label = self.gt_encoder.background_label
         max_instances = max(
             (len(targets_per_image.gt_classes) for targets_per_image in targets), default=0
-        ) + 1
+        )
         batch_size = len(targets)
 
         masks = torch.zeros(
@@ -681,7 +680,7 @@ class LatentFormer(nn.Module):
         )
         labels = torch.full(
             (batch_size, max_instances),
-            background_label,
+            self.gt_encoder.background_label,
             dtype=torch.long,
             device=self.device,
         )
@@ -693,20 +692,7 @@ class LatentFormer(nn.Module):
         pad_mask = torch.zeros((batch_size, max_instances), dtype=torch.bool, device=self.device)
 
         for idx, targets_per_image in enumerate(targets):
-            image_height, image_width = images.image_sizes[idx]
             num_instances = len(targets_per_image.gt_classes)
-            background_idx = num_instances
-            masks[idx, background_idx, :image_height, :image_width] = 1.0
-            boxes[idx, background_idx] = boxes.new_tensor(
-                [
-                    image_width * 0.5 / float(w_pad),
-                    image_height * 0.5 / float(h_pad),
-                    image_width / float(w_pad),
-                    image_height / float(h_pad),
-                ]
-            )
-            pad_mask[idx, background_idx] = True
-
             if num_instances > 0 and not hasattr(targets_per_image, "gt_boxes"):
                 raise ValueError("LatentFormer GroundTruthEncoder requires annotation gt_boxes.")
             if num_instances == 0:
@@ -720,11 +706,6 @@ class LatentFormer(nn.Module):
                 dtype=masks.dtype
             )
             labels[idx, :num_instances] = targets_per_image.gt_classes
-            bg_height = min(gt_masks.shape[-2], image_height)
-            bg_width = min(gt_masks.shape[-1], image_width)
-            masks[idx, background_idx, :bg_height, :bg_width] = 1.0 - gt_masks[
-                :, :bg_height, :bg_width
-            ].to(dtype=masks.dtype).clamp(0, 1).amax(dim=0)
             gt_boxes = targets_per_image.gt_boxes.tensor.to(device=self.device, dtype=boxes.dtype)
             x0, y0, x1, y1 = gt_boxes.unbind(dim=-1)
             boxes[idx, :num_instances] = torch.stack(
