@@ -69,6 +69,26 @@ class ClusteringSeedSelection(SeedSelectionBase):
         self.threshold_pr_mlp = ThresholdPrecisionRecallMLP(
             hidden_dim=seed_cluster_pr_hidden_dim,
         )
+        self.class_threshold_pr_mlp = ThresholdPrecisionRecallMLP(
+            hidden_dim=seed_cluster_pr_hidden_dim,
+        )
+
+    def _threshold_pr_mlp(self, policy: str) -> nn.Module:
+        if policy == "mask":
+            return self.threshold_pr_mlp
+        if policy == "class":
+            return self.class_threshold_pr_mlp
+        raise ValueError(f"Unsupported clustering threshold policy: {policy}")
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        class_prefix = prefix + "class_threshold_pr_mlp."
+        mask_prefix = prefix + "threshold_pr_mlp."
+        has_class_policy = any(key.startswith(class_prefix) for key in state_dict)
+        if not has_class_policy:
+            for key, value in list(state_dict.items()):
+                if key.startswith(mask_prefix):
+                    state_dict[class_prefix + key[len(mask_prefix):]] = value
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _sample_seed_cluster_thresholds(self, device):
         seed_min, seed_max = self.seed_cluster_pr_seed_threshold_range
@@ -90,6 +110,7 @@ class ClusteringSeedSelection(SeedSelectionBase):
         query_seed_logits: torch.Tensor,
         matched_query_mask: torch.Tensor,
         matched_gt_indices: torch.Tensor,
+        policy: str = "mask",
     ) -> torch.Tensor:
         seed_thresholds, duplicate_thresholds = self._sample_seed_cluster_thresholds(
             query_signatures.device
@@ -106,7 +127,8 @@ class ClusteringSeedSelection(SeedSelectionBase):
             duplicate_threshold=duplicate_thresholds,
             metric=self.similarity_metric,
         )
-        seed_cluster_pr_pred = self.threshold_pr_mlp(
+        predictor = self._threshold_pr_mlp(policy)
+        seed_cluster_pr_pred = predictor(
             seed_cluster_metrics["seed_thresholds"],
             seed_cluster_metrics["duplicate_thresholds"],
         )
@@ -119,7 +141,7 @@ class ClusteringSeedSelection(SeedSelectionBase):
         ).to(device=seed_cluster_pr_pred.device, dtype=seed_cluster_pr_pred.dtype)
         return F.mse_loss(seed_cluster_pr_pred, seed_cluster_pr_target.detach())
 
-    def best_thresholds(self) -> tuple[float, float]:
+    def best_thresholds(self, policy: str = "mask") -> tuple[float, float]:
         num_points = int(self.seed_cluster_pr_inference_num_points)
         if num_points <= 0:
             raise ValueError(
@@ -129,7 +151,8 @@ class ClusteringSeedSelection(SeedSelectionBase):
 
         seed_min, seed_max = self.seed_cluster_pr_seed_threshold_range
         duplicate_min, duplicate_max = self.seed_cluster_pr_duplicate_threshold_range
-        device = next(self.threshold_pr_mlp.parameters()).device
+        predictor = self._threshold_pr_mlp(policy)
+        device = next(predictor.parameters()).device
         seed_thresholds = torch.linspace(float(seed_min), float(seed_max), num_points, device=device)
         duplicate_thresholds = torch.linspace(
             float(duplicate_min),
@@ -138,7 +161,7 @@ class ClusteringSeedSelection(SeedSelectionBase):
             device=device,
         )
         with torch.no_grad():
-            pr = self.threshold_pr_mlp(seed_thresholds, duplicate_thresholds)
+            pr = predictor(seed_thresholds, duplicate_thresholds)
             precision = pr[..., 0]
             recall = pr[..., 1]
             rq = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
@@ -187,10 +210,11 @@ class ClusteringSeedSelection(SeedSelectionBase):
         gt_pad_mask: torch.Tensor = None,
         seed_threshold: float = None,
         duplicate_threshold: float = None,
+        policy: str = "mask",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         del gt_signatures, gt_pad_mask
         if seed_threshold is None or duplicate_threshold is None:
-            seed_threshold, duplicate_threshold = self.best_thresholds()
+            seed_threshold, duplicate_threshold = self.best_thresholds(policy=policy)
 
         q_sig_flat = self._flatten_query_features(query_signatures, "query_signatures")
         q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
@@ -322,7 +346,9 @@ class GoldenSeedSelection(SeedSelectionBase):
         query_seed_logits: torch.Tensor,
         gt_signatures: torch.Tensor = None,
         gt_pad_mask: torch.Tensor = None,
+        policy: str = "mask",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del policy
         self._require_gt_signatures(gt_signatures, gt_pad_mask)
         q_sig_flat = self._flatten_query_features(query_signatures, "query_signatures")
         q_seed_logits_flat = self._flatten_query_logits(query_seed_logits, "query_seed_logits").float()
@@ -367,7 +393,9 @@ class GTOracleSeedSelection(SeedSelectionBase):
         query_seed_logits: torch.Tensor,
         gt_signatures: torch.Tensor = None,
         gt_pad_mask: torch.Tensor = None,
+        policy: str = "mask",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del policy
         del query_signatures, query_seed_logits
         self._require_gt_signatures(gt_signatures, gt_pad_mask)
         gt_pad_mask = gt_pad_mask.to(device=gt_signatures.device)

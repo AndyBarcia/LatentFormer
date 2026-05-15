@@ -421,15 +421,27 @@ class LatentFormer(nn.Module):
                 outputs["pred_mask_seed_logits"],
                 gt_signatures=gt_signatures,
                 gt_pad_mask=gt_pad_mask,
+                policy="mask",
             )
             gt_class_signatures = outputs.get("gt_semantic_class_signatures")
             gt_class_pad_mask = targets.get("semantic_pad_mask") if targets is not None else None
-            class_seed_signatures, class_seed_pad_mask, class_seed_scores = seed_selection(
-                outputs["pred_class_signatures"],
-                outputs["pred_class_seed_logits"],
-                gt_signatures=gt_class_signatures,
-                gt_pad_mask=gt_class_pad_mask,
-            )
+            if mode == "ClusteringSeedSelection":
+                class_seed_signatures, class_seed_pad_mask, class_seed_scores = (
+                    self.clustering_class_seed_selection(
+                        seed_selection,
+                        outputs["pred_class_signatures"],
+                        outputs["pred_class_seed_logits"],
+                        outputs["class_signatures"],
+                    )
+                )
+            else:
+                class_seed_signatures, class_seed_pad_mask, class_seed_scores = seed_selection(
+                    outputs["pred_class_signatures"],
+                    outputs["pred_class_seed_logits"],
+                    gt_signatures=gt_class_signatures,
+                    gt_pad_mask=gt_class_pad_mask,
+                    policy="class",
+                )
             class_seed_labels = self.class_labels_from_signatures(
                 class_seed_signatures,
                 class_seed_pad_mask,
@@ -453,6 +465,92 @@ class LatentFormer(nn.Module):
         if len(mode_results) == 1:
             return next(iter(mode_results.values()))
         return mode_results
+
+    def clustering_class_seed_selection(
+        self,
+        seed_selection,
+        query_class_signatures,
+        query_class_seed_logits,
+        all_class_signatures,
+    ):
+        q_sig_flat = LatentAggregator._flatten_layer_queries(
+            query_class_signatures,
+            "pred_class_signatures",
+        )
+        q_logits_flat = self._flatten_layer_logits(
+            query_class_seed_logits,
+            "pred_class_seed_logits",
+        ).float()
+        q_scores = q_logits_flat.sigmoid()
+
+        seed_threshold, _ = seed_selection.best_thresholds(policy="class")
+        seed_threshold = max(float(seed_threshold), 0.03)
+        selected_mask = q_scores >= seed_threshold
+        empty_selection = ~selected_mask.any(dim=1)
+        if empty_selection.any():
+            fallback_indices = q_scores.argmax(dim=1)
+            selected_mask = selected_mask.clone()
+            selected_mask[empty_selection, fallback_indices[empty_selection]] = True
+
+        all_class_signatures = all_class_signatures.to(
+            device=q_sig_flat.device,
+            dtype=q_sig_flat.dtype,
+        )
+        all_class_signatures = all_class_signatures.unsqueeze(0).expand(
+            q_sig_flat.shape[0],
+            -1,
+            -1,
+        )
+        predicted_labels = pairwise_similarity(
+            q_sig_flat,
+            all_class_signatures,
+            metric=self.aggregator.aggregation_similarity_metric,
+        ).argmax(dim=-1)
+
+        batch_seed_signatures = []
+        batch_seed_scores = []
+        max_num_seeds = 0
+        for signatures_per_image, scores_per_image, labels_per_image, selected in zip(
+            q_sig_flat,
+            q_scores,
+            predicted_labels,
+            selected_mask,
+        ):
+            selected_indices = selected.nonzero(as_tuple=False).flatten()
+            image_seed_indices = []
+            for label in labels_per_image[selected_indices].unique(sorted=True):
+                class_indices = selected_indices[labels_per_image[selected_indices] == label]
+                best_idx = class_indices[scores_per_image[class_indices].argmax()]
+                image_seed_indices.append(best_idx)
+
+            image_seed_indices = torch.stack(image_seed_indices)
+            order = scores_per_image[image_seed_indices].argsort(descending=True)
+            image_seed_indices = image_seed_indices[order]
+            image_seed_indices = image_seed_indices[:64]
+            image_seed_signatures = signatures_per_image[image_seed_indices]
+            image_seed_scores = scores_per_image[image_seed_indices]
+            batch_seed_signatures.append(image_seed_signatures)
+            batch_seed_scores.append(image_seed_scores)
+            max_num_seeds = max(max_num_seeds, image_seed_signatures.shape[0])
+
+        batch_size = q_sig_flat.shape[0]
+        sig_dim = q_sig_flat.shape[-1]
+        seed_signatures = q_sig_flat.new_zeros((batch_size, max_num_seeds, sig_dim))
+        seed_scores = q_scores.new_zeros((batch_size, max_num_seeds))
+        pad_mask = torch.zeros(
+            (batch_size, max_num_seeds),
+            dtype=torch.bool,
+            device=q_sig_flat.device,
+        )
+        for batch_idx, (image_seed_signatures, image_seed_scores) in enumerate(
+            zip(batch_seed_signatures, batch_seed_scores)
+        ):
+            num_seeds = image_seed_signatures.shape[0]
+            seed_signatures[batch_idx, :num_seeds] = image_seed_signatures
+            seed_scores[batch_idx, :num_seeds] = image_seed_scores
+            pad_mask[batch_idx, :num_seeds] = True
+
+        return seed_signatures, pad_mask, seed_scores
 
     def _inference_with_seeds(
         self,
@@ -516,6 +614,7 @@ class LatentFormer(nn.Module):
             semantic_pred_results,
             class_seed_pad_mask,
             class_seed_labels,
+            class_seed_scores,
         )
         object_class_scores = self.batched_object_class_scores(
             semantic_prob_results,
@@ -671,7 +770,13 @@ class LatentFormer(nn.Module):
         labels = similarity.argmax(dim=-1)
         return labels.masked_fill(~class_seed_pad_mask, 0)
 
-    def batched_semantic_inference(self, semantic_pred, class_seed_pad_mask, class_seed_labels):
+    def batched_semantic_inference(
+        self,
+        semantic_pred,
+        class_seed_pad_mask,
+        class_seed_labels,
+        class_seed_scores,
+    ):
         batch_size, _, height, width = semantic_pred.shape
         full_semantic = semantic_pred.new_zeros(
             (batch_size, self.sem_seg_head.num_classes, height, width)
@@ -679,8 +784,10 @@ class LatentFormer(nn.Module):
         if semantic_pred.shape[1] == 0:
             return full_semantic
 
+        score_prior = class_seed_scores.to(dtype=semantic_pred.dtype).clamp_min(1e-6).log()
+        semantic_logits = semantic_pred + score_prior[:, :, None, None]
         seed_probs = F.softmax(
-            semantic_pred.masked_fill(
+            semantic_logits.masked_fill(
                 ~class_seed_pad_mask[:, :, None, None],
                 torch.finfo(semantic_pred.dtype).min,
             ),

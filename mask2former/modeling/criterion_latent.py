@@ -271,6 +271,7 @@ class LatentCriterion(nn.Module):
         num_signatures,
         prefix,
         clustering_seed_selection,
+        clustering_policy,
     ):
         q_sig_flat = self._flatten_query_features(query_signatures, f"pred_{prefix}_signatures")
         q_seed_logits_flat = self._flatten_query_logits(
@@ -332,6 +333,7 @@ class LatentCriterion(nn.Module):
             query_seed_logits=q_seed_logits_flat,
             matched_query_mask=matched_query_mask,
             matched_gt_indices=matched_gt_indices,
+            policy=clustering_policy,
         )
 
         return {
@@ -354,6 +356,7 @@ class LatentCriterion(nn.Module):
             num_signatures=num_signatures,
             prefix="mask",
             clustering_seed_selection=outputs["clustering_seed_selection"],
+            clustering_policy="mask",
         )
         losses["loss_seed"] = losses.pop("loss_mask_seed")
         losses["loss_seed_sig"] = losses.pop("loss_mask_seed_sig")
@@ -371,6 +374,7 @@ class LatentCriterion(nn.Module):
                     num_signatures=num_class_signatures,
                     prefix="class",
                     clustering_seed_selection=outputs["clustering_seed_selection"],
+                    clustering_policy="class",
                 )
             )
 

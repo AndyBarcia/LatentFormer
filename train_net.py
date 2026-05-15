@@ -26,11 +26,14 @@ import itertools
 import json
 import logging
 import os
+import weakref
 
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
+from urllib.parse import urlparse
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -46,6 +49,7 @@ from detectron2.engine import (
     default_setup,
     launch,
 )
+from detectron2.engine.train_loop import TrainerBase
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
@@ -109,8 +113,15 @@ def plot_latentformer_seed_cluster_pr_predictions(cfg, model, iteration=None):
         if "ClusteringSeedSelection" in seed_selection_modules
         else None
     )
-    predictor = getattr(clustering_seed_selection, "threshold_pr_mlp", None)
-    if predictor is None:
+    predictors = []
+    for policy_name, attr_name in (
+        ("mask", "threshold_pr_mlp"),
+        ("class", "class_threshold_pr_mlp"),
+    ):
+        predictor = getattr(clustering_seed_selection, attr_name, None)
+        if predictor is not None:
+            predictors.append((policy_name, predictor))
+    if not predictors:
         return None
 
     import matplotlib
@@ -123,81 +134,86 @@ def plot_latentformer_seed_cluster_pr_predictions(cfg, model, iteration=None):
     seed_min, seed_max = pr_cfg.SEED_THRESHOLD_RANGE
     duplicate_min, duplicate_max = pr_cfg.DUPLICATE_THRESHOLD_RANGE
 
-    device = next(predictor.parameters()).device
-    seed_thresholds = torch.linspace(float(seed_min), float(seed_max), num_points, device=device)
-    duplicate_thresholds = torch.linspace(
-        float(duplicate_min),
-        float(duplicate_max),
-        num_points,
-        device=device,
-    )
-    was_training = predictor.training
-    predictor.eval()
-    with torch.no_grad():
-        predictions = predictor(seed_thresholds, duplicate_thresholds).detach().cpu()
-    if was_training:
-        predictor.train()
-
-    precision = predictions[..., 0].reshape(-1)
-    recall = predictions[..., 1].reshape(-1)
-    seed_grid, _ = torch.meshgrid(
-        seed_thresholds.detach().cpu(),
-        duplicate_thresholds.detach().cpu(),
-        indexing="ij",
-    )
-    flat_seed = seed_grid.reshape(-1)
-    pareto = _pareto_frontier_indices(precision, recall)
-
     plot_dir = os.path.join(cfg.OUTPUT_DIR, "seed_cluster_pr_plots")
     os.makedirs(plot_dir, exist_ok=True)
-    if iteration is None:
-        name = "threshold_pr_mlp_eval"
-    else:
-        name = f"threshold_pr_mlp_iter_{int(iteration):07d}"
-    output_path = os.path.join(plot_dir, f"{name}.jpg")
-    latest_path = os.path.join(plot_dir, "threshold_pr_mlp_latest.jpg")
+    output_paths = []
 
-    fig, ax = plt.subplots(figsize=(8, 6), dpi=160)
-    scatter = ax.scatter(
-        recall.numpy(),
-        precision.numpy(),
-        c=flat_seed.numpy(),
-        s=4,
-        alpha=0.22,
-        cmap="viridis",
-        linewidths=0,
-    )
-    if pareto.numel() > 0:
-        ax.plot(
-            recall[pareto].numpy(),
-            precision[pareto].numpy(),
-            color="#d62728",
-            linewidth=2.2,
-            label=f"Pareto frontier ({pareto.numel()} pts)",
+    for policy_name, predictor in predictors:
+        device = next(predictor.parameters()).device
+        seed_thresholds = torch.linspace(float(seed_min), float(seed_max), num_points, device=device)
+        duplicate_thresholds = torch.linspace(
+            float(duplicate_min),
+            float(duplicate_max),
+            num_points,
+            device=device,
         )
-        ax.scatter(
-            recall[pareto].numpy(),
-            precision[pareto].numpy(),
-            color="#d62728",
-            s=10,
-            zorder=3,
+        was_training = predictor.training
+        predictor.eval()
+        with torch.no_grad():
+            predictions = predictor(seed_thresholds, duplicate_thresholds).detach().cpu()
+        if was_training:
+            predictor.train()
+
+        precision = predictions[..., 0].reshape(-1)
+        recall = predictions[..., 1].reshape(-1)
+        seed_grid, _ = torch.meshgrid(
+            seed_thresholds.detach().cpu(),
+            duplicate_thresholds.detach().cpu(),
+            indexing="ij",
         )
-    ax.set_xlabel("Predicted recall")
-    ax.set_ylabel("Predicted precision")
-    ax.set_title("Threshold MLP precision-recall predictions")
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.grid(True, alpha=0.25)
-    cbar = fig.colorbar(scatter, ax=ax)
-    cbar.set_label("Seed threshold")
-    if pareto.numel() > 0:
-        ax.legend(loc="lower left")
-    fig.tight_layout()
-    fig.savefig(output_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
-    fig.savefig(latest_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
-    plt.close(fig)
-    logging.getLogger(__name__).info("Wrote LatentFormer PR threshold plot to %s", output_path)
-    return output_path
+        flat_seed = seed_grid.reshape(-1)
+        pareto = _pareto_frontier_indices(precision, recall)
+
+        if iteration is None:
+            name = f"{policy_name}_threshold_pr_mlp_eval"
+        else:
+            name = f"{policy_name}_threshold_pr_mlp_iter_{int(iteration):07d}"
+        output_path = os.path.join(plot_dir, f"{name}.jpg")
+        latest_path = os.path.join(plot_dir, f"{policy_name}_threshold_pr_mlp_latest.jpg")
+
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=160)
+        scatter = ax.scatter(
+            recall.numpy(),
+            precision.numpy(),
+            c=flat_seed.numpy(),
+            s=4,
+            alpha=0.22,
+            cmap="viridis",
+            linewidths=0,
+        )
+        if pareto.numel() > 0:
+            ax.plot(
+                recall[pareto].numpy(),
+                precision[pareto].numpy(),
+                color="#d62728",
+                linewidth=2.2,
+                label=f"Pareto frontier ({pareto.numel()} pts)",
+            )
+            ax.scatter(
+                recall[pareto].numpy(),
+                precision[pareto].numpy(),
+                color="#d62728",
+                s=10,
+                zorder=3,
+            )
+        ax.set_xlabel("Predicted recall")
+        ax.set_ylabel("Predicted precision")
+        ax.set_title(f"{policy_name.title()} threshold MLP precision-recall predictions")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, alpha=0.25)
+        cbar = fig.colorbar(scatter, ax=ax)
+        cbar.set_label("Seed threshold")
+        if pareto.numel() > 0:
+            ax.legend(loc="lower left")
+        fig.tight_layout()
+        fig.savefig(output_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
+        fig.savefig(latest_path, format="jpg", pil_kwargs={"quality": 85, "optimize": True})
+        plt.close(fig)
+        output_paths.append(output_path)
+        logging.getLogger(__name__).info("Wrote LatentFormer PR threshold plot to %s", output_path)
+
+    return output_paths[-1] if output_paths else None
 
 
 class LatentFormerMultiModeEvaluator(DatasetEvaluator):
@@ -309,10 +325,99 @@ def _build_detection_test_loader_with_batch_size(cfg, dataset_name, mapper):
     )
 
 
+class LatentFormerDetectionCheckpointer(DetectionCheckpointer):
+    def load(self, path: str, checkpointables=None):
+        assert self._parsed_url_during_load is None
+        need_sync = False
+        logger = logging.getLogger(__name__)
+        logger.info("[DetectionCheckpointer] Loading from {} ...".format(path))
+
+        if path and isinstance(self.model, DistributedDataParallel):
+            path = self.path_manager.get_local_path(path)
+            has_file = os.path.isfile(path)
+            all_has_file = comm.all_gather(has_file)
+            if not all_has_file[0]:
+                raise OSError(f"File {path} not found on main worker.")
+            if not all(all_has_file):
+                logger.warning(
+                    f"Not all workers can read checkpoint {path}. "
+                    "Training may fail to fully resume."
+                )
+                need_sync = True
+            if not has_file:
+                path = None
+
+        if path:
+            parsed_url = urlparse(path)
+            self._parsed_url_during_load = parsed_url
+            path = parsed_url._replace(query="").geturl()
+            path = self.path_manager.get_local_path(path)
+
+        ret = self._load_with_flexible_trainer_state(path, checkpointables)
+
+        if need_sync:
+            logger.info("Broadcasting model states from main worker ...")
+            self.model._sync_params_and_buffers()
+        self._parsed_url_during_load = None
+        return ret
+
+    def _load_with_flexible_trainer_state(self, path: str, checkpointables=None):
+        if not path:
+            self.logger.info("No checkpoint found. Initializing model from scratch")
+            return {}
+        self.logger.info("[Checkpointer] Loading from {} ...".format(path))
+        if not os.path.isfile(path):
+            path = self.path_manager.get_local_path(path)
+            assert os.path.isfile(path), "Checkpoint {} not found!".format(path)
+
+        checkpoint = self._load_file(path)
+        incompatible = self._load_model(checkpoint)
+        if incompatible is not None:
+            self._log_incompatible_keys(incompatible)
+
+        keys = self.checkpointables if checkpointables is None else checkpointables
+        for key in keys:
+            if key not in checkpoint:
+                continue
+            self.logger.info("Loading {} from {} ...".format(key, path))
+            obj = self.checkpointables[key]
+            state = checkpoint.pop(key)
+            try:
+                obj.load_state_dict(state)
+            except ValueError as exc:
+                if key != "trainer" or "different number of parameter groups" not in str(exc):
+                    raise
+                self.logger.warning(
+                    "Skipping incompatible optimizer state from %s because the model "
+                    "parameter groups changed. Iteration and hook state will still be resumed.",
+                    path,
+                )
+                TrainerBase.load_state_dict(obj, state)
+                inner_state = state.get("_trainer")
+                inner_trainer = getattr(obj, "_trainer", None)
+                if inner_state is not None and inner_trainer is not None:
+                    TrainerBase.load_state_dict(inner_trainer, inner_state)
+                    if hasattr(inner_trainer, "grad_scaler") and "grad_scaler" in inner_state:
+                        inner_trainer.grad_scaler.load_state_dict(inner_state["grad_scaler"])
+                elif hasattr(obj, "grad_scaler") and "grad_scaler" in state:
+                    obj.grad_scaler.load_state_dict(state["grad_scaler"])
+
+        return checkpoint
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        if cfg.MODEL.META_ARCHITECTURE == "LatentFormer":
+            self.checkpointer = LatentFormerDetectionCheckpointer(
+                self.model,
+                cfg.OUTPUT_DIR,
+                trainer=weakref.proxy(self),
+            )
 
     def test_and_save_results(self):
         results = super().test_and_save_results()
