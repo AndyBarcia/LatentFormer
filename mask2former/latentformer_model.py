@@ -16,7 +16,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from .modeling.criterion_latent import LatentCriterion
 from .modeling.gt_encoder import GroundTruthEncoder
 from .modeling.matcher_latent import LatentMatcher
-from .modeling.seed_selection import build_seed_selection_modules
+from .modeling.seed_selection import ClusteringSeedSelection, build_seed_selection_modules
 from .modeling.similarity import pairwise_similarity
 from .utils.padding import image_padding_mask
 
@@ -184,6 +184,7 @@ class LatentFormer(nn.Module):
         gt_encoder: nn.Module,
         aggregator: nn.Module,
         seed_selection_modules: nn.Module,
+        prior_clustering_seed_selection: nn.Module,
         num_queries: int,
         metadata,
         size_divisibility: int,
@@ -206,6 +207,7 @@ class LatentFormer(nn.Module):
         self.gt_encoder = gt_encoder
         self.aggregator = aggregator
         self.seed_selection_modules = seed_selection_modules
+        self.prior_clustering_seed_selection = prior_clustering_seed_selection
         self.num_queries = num_queries
         self.metadata = metadata
         if size_divisibility < 0:
@@ -239,13 +241,11 @@ class LatentFormer(nn.Module):
         seed_sig_weight = cfg.MODEL.LATENT_FORMER.SEED_SIG_WEIGHT
         seed_weight_pattern_weight = cfg.MODEL.LATENT_FORMER.SEED_WEIGHT_PATTERN_WEIGHT
         seed_cluster_pr_weight = cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR_WEIGHT
-        weight_dict = {
+        branch_weight_dict = {
             "loss_mask": mask_weight,
             "loss_dice": dice_weight,
             "loss_sem_mask": mask_weight,
             "loss_sem_dice": dice_weight,
-            "loss_gt_sep": gt_sep_weight,
-            "loss_class_gt_sep": gt_sep_weight,
             "loss_seed": seed_weight,
             "loss_seed_sig": seed_sig_weight,
             "loss_seed_weight": seed_weight_pattern_weight,
@@ -255,9 +255,34 @@ class LatentFormer(nn.Module):
             "loss_class_seed_weight": seed_weight_pattern_weight,
             "loss_class_seed_cluster_pr": seed_cluster_pr_weight,
         }
+        weight_dict = {
+            "loss_gt_sep": gt_sep_weight,
+            "loss_class_gt_sep": gt_sep_weight,
+        }
+        for branch in ("prior", "posterior"):
+            weight_dict.update(
+                {f"{name}_{branch}": weight for name, weight in branch_weight_dict.items()}
+            )
         eval_modes = tuple(cfg.MODEL.LATENT_FORMER.TEST.EVAL_MODES)
         seed_selection_modules = build_seed_selection_modules(
             eval_modes=eval_modes,
+            similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
+            seed_cluster_pr_num_seed_thresholds=cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.NUM_SEED_THRESHOLDS,
+            seed_cluster_pr_num_duplicate_thresholds=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.NUM_DUPLICATE_THRESHOLDS
+            ),
+            seed_cluster_pr_seed_threshold_range=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.SEED_THRESHOLD_RANGE
+            ),
+            seed_cluster_pr_duplicate_threshold_range=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.DUPLICATE_THRESHOLD_RANGE
+            ),
+            seed_cluster_pr_hidden_dim=cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.HIDDEN_DIM,
+            seed_cluster_pr_inference_num_points=(
+                cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.INFERENCE_NUM_POINTS
+            ),
+        )
+        prior_clustering_seed_selection = ClusteringSeedSelection(
             similarity_metric=cfg.MODEL.LATENT_FORMER.AGGREGATION_SIMILARITY_METRIC,
             seed_cluster_pr_num_seed_thresholds=cfg.MODEL.LATENT_FORMER.SEED_CLUSTER_PR.NUM_SEED_THRESHOLDS,
             seed_cluster_pr_num_duplicate_thresholds=(
@@ -301,6 +326,7 @@ class LatentFormer(nn.Module):
             "gt_encoder": gt_encoder,
             "aggregator": aggregator,
             "seed_selection_modules": seed_selection_modules,
+            "prior_clustering_seed_selection": prior_clustering_seed_selection,
             "num_queries": cfg.MODEL.LATENT_FORMER.NUM_OBJECT_QUERIES,
             "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
             "size_divisibility": cfg.MODEL.LATENT_FORMER.SIZE_DIVISIBILITY,
@@ -359,6 +385,36 @@ class LatentFormer(nn.Module):
             outputs["semantic_masks"] = semantic_masks
             outputs["object_mask_emb"] = object_mask_emb
             outputs["semantic_mask_emb"] = semantic_mask_emb
+            prior_object_masks, prior_semantic_masks, prior_object_mask_emb, prior_semantic_mask_emb = (
+                self.aggregator(
+                    outputs["pred_masks"],
+                    outputs["prior_pred_mask_signatures"],
+                    outputs["prior_pred_class_signatures"],
+                    outputs["prior_pred_mask_seed_logits"],
+                    outputs["prior_pred_class_seed_logits"],
+                    outputs["gt_mask_signatures"],
+                    class_signatures=outputs["gt_semantic_class_signatures"],
+                    mask_features=outputs["mask_features"],
+                    target_pad_mask=targets["pad_mask"],
+                    class_pad_mask=targets["semantic_pad_mask"],
+                )
+            )
+            outputs["posterior_pred_mask_signatures"] = outputs["pred_mask_signatures"]
+            outputs["posterior_pred_class_signatures"] = outputs["pred_class_signatures"]
+            outputs["posterior_pred_mask_seed_logits"] = outputs["pred_mask_seed_logits"]
+            outputs["posterior_pred_class_seed_logits"] = outputs["pred_class_seed_logits"]
+            outputs["posterior_object_masks"] = object_masks
+            outputs["posterior_semantic_masks"] = semantic_masks
+            outputs["posterior_object_mask_emb"] = object_mask_emb
+            outputs["posterior_semantic_mask_emb"] = semantic_mask_emb
+            outputs["prior_object_masks"] = prior_object_masks
+            outputs["prior_semantic_masks"] = prior_semantic_masks
+            outputs["prior_object_mask_emb"] = prior_object_mask_emb
+            outputs["prior_semantic_mask_emb"] = prior_semantic_mask_emb
+            outputs["prior_clustering_seed_selection"] = self.prior_clustering_seed_selection
+            outputs["posterior_clustering_seed_selection"] = self.seed_selection_modules[
+                "ClusteringSeedSelection"
+            ]
             outputs["clustering_seed_selection"] = self.seed_selection_modules[
                 "ClusteringSeedSelection"
             ]

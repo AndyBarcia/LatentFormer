@@ -391,8 +391,50 @@ class LatentCriterion(nn.Module):
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, num_signatures)
 
+    def _branch_outputs(self, outputs, branch):
+        branch_outputs = dict(outputs)
+        if branch == "posterior":
+            if "posterior_clustering_seed_selection" in outputs:
+                branch_outputs["clustering_seed_selection"] = outputs[
+                    "posterior_clustering_seed_selection"
+                ]
+            return branch_outputs
+
+        branch_outputs["object_masks"] = outputs[f"{branch}_object_masks"]
+        branch_outputs["semantic_masks"] = outputs[f"{branch}_semantic_masks"]
+        branch_outputs["object_mask_emb"] = outputs[f"{branch}_object_mask_emb"]
+        branch_outputs["semantic_mask_emb"] = outputs[f"{branch}_semantic_mask_emb"]
+        branch_outputs["pred_mask_signatures"] = outputs[f"{branch}_pred_mask_signatures"]
+        branch_outputs["pred_class_signatures"] = outputs[f"{branch}_pred_class_signatures"]
+        branch_outputs["pred_mask_seed_logits"] = outputs[f"{branch}_pred_mask_seed_logits"]
+        branch_outputs["pred_class_seed_logits"] = outputs[f"{branch}_pred_class_seed_logits"]
+        branch_outputs["pred_seed_logits"] = branch_outputs["pred_mask_seed_logits"]
+        branch_outputs["clustering_seed_selection"] = outputs[
+            f"{branch}_clustering_seed_selection"
+        ]
+        return branch_outputs
+
     def forward(self, outputs, targets):
         num_signatures = self._get_global_normalizer(targets["pad_mask"].sum())
+
+        if "prior_object_masks" in outputs:
+            losses = {}
+            for loss in self.losses:
+                if loss == "gt_sep":
+                    losses.update(self.get_loss(loss, outputs, targets, num_signatures))
+                    continue
+
+                for branch in ("prior", "posterior"):
+                    branch_losses = self.get_loss(
+                        loss,
+                        self._branch_outputs(outputs, branch),
+                        targets,
+                        num_signatures,
+                    )
+                    losses.update(
+                        {f"{name}_{branch}": value for name, value in branch_losses.items()}
+                    )
+            return losses
 
         losses = {}
         for loss in self.losses:

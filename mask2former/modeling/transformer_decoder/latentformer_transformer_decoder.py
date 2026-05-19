@@ -119,6 +119,7 @@ class LatentTransformerDecoder(nn.Module):
         self.num_heads = nheads
         self.num_layers = dec_layers
         self.num_queries = num_queries
+        self.sig_dim = sig_dim
         self.num_feature_levels = num_feature_levels
         self.attn_bias_eps = 1e-6
 
@@ -190,6 +191,25 @@ class LatentTransformerDecoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
+        self.prior_mask_signatures = nn.Parameter(
+            torch.randn(dec_layers, num_queries, sig_dim) * (sig_dim**-0.5)
+        )
+        self.prior_class_signatures = nn.Parameter(
+            torch.randn(dec_layers, num_queries, sig_dim) * (sig_dim**-0.5)
+        )
+        self.prior_mask_seed_logits = nn.Parameter(torch.zeros(dec_layers, num_queries))
+        self.prior_class_seed_logits = nn.Parameter(torch.zeros(dec_layers, num_queries))
+        self._init_delta_heads()
+
+    def _init_delta_heads(self):
+        for head in (
+            self.mask_sig_head,
+            self.class_sig_head,
+            self.seed_head,
+            self.class_seed_head,
+        ):
+            nn.init.normal_(head[-1].weight, std=1e-3)
+            nn.init.zeros_(head[-1].bias)
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -237,7 +257,11 @@ class LatentTransformerDecoder(nn.Module):
         predictions_class_sig = []
         predictions_mask_seed = []
         predictions_class_seed = []
-        _, _, _, _, _, attn_biases = self.forward_prediction_heads(
+        prior_predictions_mask_sig = []
+        prior_predictions_class_sig = []
+        prior_predictions_mask_seed = []
+        prior_predictions_class_seed = []
+        _, _, _, _, _, _, _, _, _, attn_biases = self.forward_prediction_heads(
             output, multi_scale_features, padding_masks
         )
 
@@ -265,14 +289,34 @@ class LatentTransformerDecoder(nn.Module):
             )
             history.append(output)
 
-            outputs_mask, outputs_mask_sig, outputs_class_sig, outputs_mask_seed, outputs_class_seed, attn_biases = (
-                self.forward_prediction_heads(output, multi_scale_features, padding_masks)
+            (
+                outputs_mask,
+                outputs_mask_sig,
+                outputs_class_sig,
+                outputs_mask_seed,
+                outputs_class_seed,
+                prior_outputs_mask_sig,
+                prior_outputs_class_sig,
+                prior_outputs_mask_seed,
+                prior_outputs_class_seed,
+                attn_biases,
+            ) = (
+                self.forward_prediction_heads(
+                    output,
+                    multi_scale_features,
+                    padding_masks,
+                    layer_idx=i,
+                )
             )
             predictions_mask.append(outputs_mask)
             predictions_mask_sig.append(outputs_mask_sig)
             predictions_class_sig.append(outputs_class_sig)
             predictions_mask_seed.append(outputs_mask_seed)
             predictions_class_seed.append(outputs_class_seed)
+            prior_predictions_mask_sig.append(prior_outputs_mask_sig)
+            prior_predictions_class_sig.append(prior_outputs_class_sig)
+            prior_predictions_mask_seed.append(prior_outputs_mask_seed)
+            prior_predictions_class_seed.append(prior_outputs_class_seed)
 
         out = {
             "pred_masks": torch.stack(predictions_mask),
@@ -280,16 +324,59 @@ class LatentTransformerDecoder(nn.Module):
             "pred_class_signatures": torch.stack(predictions_class_sig),
             "pred_mask_seed_logits": torch.stack(predictions_mask_seed),
             "pred_class_seed_logits": torch.stack(predictions_class_seed),
+            "prior_pred_mask_signatures": torch.stack(prior_predictions_mask_sig),
+            "prior_pred_class_signatures": torch.stack(prior_predictions_class_sig),
+            "prior_pred_mask_seed_logits": torch.stack(prior_predictions_mask_seed),
+            "prior_pred_class_seed_logits": torch.stack(prior_predictions_class_seed),
         }
         out["pred_seed_logits"] = out["pred_mask_seed_logits"]
         return out
 
-    def forward_prediction_heads(self, output, multi_scale_features, padding_masks=None):
+    def forward_prediction_heads(
+        self,
+        output,
+        multi_scale_features,
+        padding_masks=None,
+        layer_idx=None,
+    ):
         decoder_output = self.decoder_norm(output)
-        outputs_mask_sig = self.mask_sig_head(decoder_output)
-        outputs_class_sig = self.class_sig_head(decoder_output)
-        outputs_mask_seed = self.seed_head(decoder_output).squeeze(-1)
-        outputs_class_seed = self.class_seed_head(decoder_output).squeeze(-1)
+        delta_mask_sig = self.mask_sig_head(decoder_output)
+        delta_class_sig = self.class_sig_head(decoder_output)
+        delta_mask_seed = self.seed_head(decoder_output).squeeze(-1)
+        delta_class_seed = self.class_seed_head(decoder_output).squeeze(-1)
+        if layer_idx is None:
+            outputs_mask_sig = delta_mask_sig
+            outputs_class_sig = delta_class_sig
+            outputs_mask_seed = delta_mask_seed
+            outputs_class_seed = delta_class_seed
+            prior_outputs_mask_sig = None
+            prior_outputs_class_sig = None
+            prior_outputs_mask_seed = None
+            prior_outputs_class_seed = None
+        else:
+            batch_size = output.shape[0]
+            prior_outputs_mask_sig = self.prior_mask_signatures[layer_idx].unsqueeze(0).expand(
+                batch_size,
+                -1,
+                -1,
+            )
+            prior_outputs_class_sig = self.prior_class_signatures[layer_idx].unsqueeze(0).expand(
+                batch_size,
+                -1,
+                -1,
+            )
+            prior_outputs_mask_seed = self.prior_mask_seed_logits[layer_idx].unsqueeze(0).expand(
+                batch_size,
+                -1,
+            )
+            prior_outputs_class_seed = self.prior_class_seed_logits[layer_idx].unsqueeze(0).expand(
+                batch_size,
+                -1,
+            )
+            outputs_mask_sig = prior_outputs_mask_sig + delta_mask_sig
+            outputs_class_sig = prior_outputs_class_sig + delta_class_sig
+            outputs_mask_seed = prior_outputs_mask_seed + delta_mask_seed
+            outputs_class_seed = prior_outputs_class_seed + delta_class_seed
 
         attn_biases = []
         mask_embed = self.mask_embed(decoder_output)
@@ -318,4 +405,15 @@ class LatentTransformerDecoder(nn.Module):
             )
             attn_biases.append(attn_bias)
 
-        return mask_embed, outputs_mask_sig, outputs_class_sig, outputs_mask_seed, outputs_class_seed, attn_biases
+        return (
+            mask_embed,
+            outputs_mask_sig,
+            outputs_class_sig,
+            outputs_mask_seed,
+            outputs_class_seed,
+            prior_outputs_mask_sig,
+            prior_outputs_class_sig,
+            prior_outputs_mask_seed,
+            prior_outputs_class_seed,
+            attn_biases,
+        )
