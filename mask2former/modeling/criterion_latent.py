@@ -283,6 +283,7 @@ class LatentCriterion(nn.Module):
 
         matched_query_mask, matched_gt_indices = self.matcher(
             q_sig_flat,
+            q_seed_logits_flat,
             gt_signatures,
             pad_mask,
         )

@@ -143,9 +143,6 @@ class LatentAggregator(nn.Module):
             similarity=semantic_sim,
             valid_mask=class_pad_mask,
         )
-        semantic_weights = semantic_weights * class_seed_gate.to(
-            dtype=semantic_weights.dtype
-        ).unsqueeze(-1)
         semantic_weights = normalize_assignment_weights(
             semantic_weights
         )
@@ -230,7 +227,10 @@ class LatentFormer(nn.Module):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
-        matcher = LatentMatcher(similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,)
+        matcher = LatentMatcher(
+            similarity_metric=cfg.MODEL.LATENT_FORMER.MATCHING_SIMILARITY_METRIC,
+            seed_cost_weight=cfg.MODEL.LATENT_FORMER.SEED_COST_WEIGHT,
+        )
 
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
