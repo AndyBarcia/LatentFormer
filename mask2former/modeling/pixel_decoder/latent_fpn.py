@@ -25,14 +25,18 @@ class LatentFPN(nn.Module):
     ):
         super().__init__()
         input_shape = sorted(input_shape.items(), key=lambda x: x[1].stride)
-        self.in_features = [k for k, _ in input_shape]
-        feature_channels = [v.channels for _, v in input_shape]
+        if num_feature_levels <= 0:
+            raise ValueError("num_feature_levels must be positive.")
+        selected_input_shape = input_shape[-num_feature_levels:]
+        selected_offset = len(input_shape) - len(selected_input_shape)
+        self.in_features = [k for k, _ in selected_input_shape]
+        feature_channels = [v.channels for _, v in selected_input_shape]
         self.num_feature_levels = num_feature_levels
 
         use_bias = norm == ""
         lateral_convs = []
         output_convs = []
-        for idx, in_channels in enumerate(feature_channels):
+        for idx, in_channels in enumerate(feature_channels, start=selected_offset):
             lateral_conv = Conv2d(
                 in_channels,
                 conv_dim,
