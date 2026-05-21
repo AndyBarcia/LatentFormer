@@ -89,16 +89,6 @@ class LatentAggregator(nn.Module):
         q_mask_emb_flat = self._flatten_layer_queries(query_mask_embeddings, "query_mask_embeddings")
         q_mask_sig_flat = self._flatten_layer_queries(query_mask_signatures, "query_mask_signatures")
         q_class_sig_flat = self._flatten_layer_queries(query_class_signatures, "query_class_signatures")
-        q_mask_seed_logits_flat = self._flatten_layer_logits(
-            query_mask_seed_logits,
-            "query_mask_seed_logits",
-        )
-        q_class_seed_logits_flat = self._flatten_layer_logits(
-            query_class_seed_logits,
-            "query_class_seed_logits",
-        )
-        non_mask_seed_gate = 1.0 - q_mask_seed_logits_flat.float().sigmoid()
-        class_seed_gate = q_class_seed_logits_flat.float().sigmoid()
 
         object_sim = pairwise_similarity(
             q_mask_sig_flat,
@@ -109,9 +99,6 @@ class LatentAggregator(nn.Module):
             similarity=object_sim,
             valid_mask=target_pad_mask,
         )
-        object_weights_flat = object_weights_flat * non_mask_seed_gate.to(
-            dtype=object_weights_flat.dtype
-        ).unsqueeze(-1)
         object_norm_w = normalize_assignment_weights(object_weights_flat)
 
         object_mask_emb = aggregate_with_weights(object_norm_w, q_mask_emb_flat)
